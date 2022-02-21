@@ -1,9 +1,4 @@
-pip install git+https://github.com/openai/CLIP.git --user
-pip install transformers~=4.10.2
 
-# parse all the params in the base_config.py;
-
-# e.g.
 import os
 def ompi_rank():
     """Find OMPI world rank without calling mpi functions
@@ -20,8 +15,10 @@ def ompi_size():
 
 is_master = ompi_rank() == 0 or ompi_size() == 1
 if is_master:
-    os.system('git clone https://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@github.com/buxiangzhiren/VQ-Diffusion-main')
-    os.chdir('./VQ-Diffusion-main')
+    os.system('git clone https://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@github.com/buxiangzhiren/CLIP_prefix_caption')
+    os.chdir('./CLIP_prefix_caption')
+    os.system('pip install git+https://github.com/openai/CLIP.git --user')
+    os.system('pip install transformers~=4.10.2 --user')
     os.system('sudo cp -r -f /zzx_vlexp/timm/helpers.py /opt/conda/lib/python3.9/site-packages/timm/models/layers/helpers.py')
     # os.mkdir('./MSCOCO_Caption')
     # os.chdir('./MSCOCO_Caption')
@@ -32,5 +29,5 @@ if is_master:
     # os.system('unzip val2014.zip')
     # os.system('unzip annotations_trainval2014.zip')
     # os.chdir('../')
-    string = "MKL_THREADING_LAYER=GPU python train.py --name coco_train --config_file configs/coco.yaml --num_node 1 --tensorboard --load_path OUTPUT/pretrained_model/CC_pretrained.pth"
+    string = "MKL_THREADING_LAYER=GPU python train.py --data /zzx_vlexp/CLIP_prefix_caption/data/coco/oscar_split_train.pkl --out_dir /zzx_vlexp/CLIP_prefix_caption/coco_train/"
     os.system(string)
