@@ -1,4 +1,3 @@
-
 import os
 def ompi_rank():
     """Find OMPI world rank without calling mpi functions
@@ -29,5 +28,5 @@ if is_master:
     # os.system('unzip val2014.zip')
     # os.system('unzip annotations_trainval2014.zip')
     # os.chdir('../')
-    string = "MKL_THREADING_LAYER=GPU python train.py --data /zzx_vlexp/CLIP_prefix_caption/data/coco/oscar_split_train.pkl --out_dir /zzx_vlexp/CLIP_prefix_caption/coco_train/"
+    string = "MKL_THREADING_LAYER=GPU python train.py --data /zzx_vlexp/CLIP_prefix_caption/data/coco/oscar_split_ViT-B_32_train.pkl --out_dir /zzx_vlexp/CLIP_prefix_caption/coco_train/"
     os.system(string)

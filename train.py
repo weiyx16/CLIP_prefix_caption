@@ -25,7 +25,7 @@ class ClipCocoDataset(Dataset):
         return len(self.captions_tokens)
 
     def pad_tokens(self, item: int):
-        tokens = self.captions_tokens[item]
+        tokens = torch.cat((torch.tensor(self.tokenizer.encode('<|endoftext|>')), self.captions_tokens[item]), dim=0)
         padding = self.max_seq_len - tokens.shape[0]
         if padding > 0:
             tokens = torch.cat((tokens, torch.zeros(padding, dtype=torch.int64) - 1))
