@@ -12,7 +12,7 @@ import sys
 import argparse
 import json
 from typing import Tuple, Optional, Union
-
+import math
 
 class MappingType(Enum):
     MLP = 'mlp'
@@ -26,26 +26,30 @@ class ClipCocoDataset(Dataset):
 
     def pad_tokens(self, item: int):
         tokens = torch.cat((torch.tensor(self.tokenizer.encode('<|endoftext|>')), self.captions_tokens[item]), dim=0)
+        gt = torch.cat((self.captions_tokens[item], torch.tensor(self.tokenizer.encode('<|endoftext|>'))), dim=0)
         padding = self.max_seq_len - tokens.shape[0]
         if padding > 0:
             tokens = torch.cat((tokens, torch.zeros(padding, dtype=torch.int64) - 1))
-            self.captions_tokens[item] = tokens
+            gt = torch.cat((gt, torch.zeros(padding, dtype=torch.int64) - 1))
         elif padding < 0:
             tokens = tokens[:self.max_seq_len]
-            self.captions_tokens[item] = tokens
-        mask = tokens.ge(0)  # mask is zero where we out of sequence
+            gt = gt[:self.max_seq_len]
+        mask = tokens.ge(0)
+        mask1 = gt.ge(0) # mask is zero where we out of sequence
+        assert mask.equal(mask1)
         tokens[~mask] = 0
+        gt[~mask1] = 0
         mask = mask.float()
         # mask = torch.cat((torch.ones(self.prefix_length), mask), dim=0)  # adding prefix mask
-        return tokens, mask
+        return tokens, mask, gt
 
     def __getitem__(self, item: int) -> Tuple[torch.Tensor, ...]:
-        tokens, mask = self.pad_tokens(item)
+        tokens, mask, gt = self.pad_tokens(item)
         prefix = self.prefixes[self.caption2embedding[item]]
         if self.normalize_prefix:
             prefix = prefix.float()
             prefix = prefix / prefix.norm(2, -1)
-        return tokens, mask, prefix
+        return tokens, mask, prefix, gt
 
     def __init__(self, data_path: str,  prefix_length: int, gpt2_type: str = "gpt2",
                  normalize_prefix=False):
@@ -226,6 +230,9 @@ class ClipCaptionModel(nn.Module):
     def forward(self, tokens: torch.Tensor, prefix: torch.Tensor, mask: Optional[torch.Tensor] = None,
                 labels: Optional[torch.Tensor] = None):
         embedding_text = self.gpt.transformer.wte(tokens)
+        batch_size = embedding_text.size()[0]
+        bos_toekn_embedding = self.bos_embedding.unsqueeze(0).repeat_interleave(repeats=batch_size, dim=0)
+        embedding_text = torch.cat((bos_toekn_embedding.unsqueeze(dim=1), embedding_text[:, 1:, :]), dim=1)
         prefix_projections = self.clip_project(prefix).view(-1, self.prefix_length, self.gpt_embedding_size)
         # embedding_cat = torch.cat((prefix_projections, embedding_text), dim=1)
         if labels is not None:
@@ -238,6 +245,7 @@ class ClipCaptionModel(nn.Module):
                  num_layers: int = 8, mapping_type: MappingType = MappingType.MLP):
         super(ClipCaptionModel, self).__init__()
         self.prefix_length = prefix_length
+        self.bos_embedding = nn.Parameter(torch.randn(768))
         self.gpt = GPT2LMHeadModel.from_pretrained('gpt2')
         self.gpt_embedding_size = self.gpt.transformer.wte.weight.shape[1]
         if mapping_type == MappingType.MLP:
@@ -309,13 +317,13 @@ def train(dataset: ClipCocoDataset, model: ClipCaptionModel, args,
         print(f">>> Training epoch {epoch}")
         sys.stdout.flush()
         progress = tqdm(total=len(train_dataloader), desc=output_prefix)
-        for idx, (tokens, mask, prefix) in enumerate(train_dataloader):
+        for idx, (tokens, mask, prefix, gt) in enumerate(train_dataloader):
             model.zero_grad()
-            tokens, mask, prefix = tokens.to(device), mask.to(device), prefix.to(device, dtype=torch.float32)
+            tokens, mask, prefix, gt = tokens.to(device), mask.to(device), prefix.to(device, dtype=torch.float32), gt.to(device)
             outputs = model(tokens, prefix, mask)
             # logits = outputs.logits[:, dataset.prefix_length - 1: -1]
             logits = outputs.logits
-            loss = nnf.cross_entropy(logits.reshape(-1, logits.shape[-1]), tokens.flatten(), ignore_index=0)
+            loss = nnf.cross_entropy(logits.reshape(-1, logits.shape[-1]), gt.flatten(), ignore_index=0)
             loss.backward()
             optimizer.step()
             scheduler.step()
@@ -338,8 +346,8 @@ def train(dataset: ClipCocoDataset, model: ClipCaptionModel, args,
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--data', default='/zzx_vlexp/CLIP_prefix_caption/data/coco/oscar_split_train.pkl')
-    parser.add_argument('--out_dir', default='/zzx_vlexp/CLIP_prefix_caption/checkpoints')
+    parser.add_argument('--data', default='./data/coco/oscar_split_train.pkl')
+    parser.add_argument('--out_dir', default='./checkpoints')
     parser.add_argument('--prefix', default='coco_prefix', help='prefix for saved filenames')
     parser.add_argument('--epochs', type=int, default=10)
     parser.add_argument('--save_every', type=int, default=1)
