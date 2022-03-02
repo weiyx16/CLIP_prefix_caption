@@ -13,6 +13,7 @@ import argparse
 import json
 from typing import Tuple, Optional, Union
 import math
+import wandb
 
 class MappingType(Enum):
     MLP = 'mlp'
@@ -246,7 +247,7 @@ class ClipCaptionModel(nn.Module):
         super(ClipCaptionModel, self).__init__()
         self.prefix_length = prefix_length
         self.bos_embedding = nn.Parameter(torch.randn(768))
-        self.gpt = GPT2LMHeadModel.from_pretrained('gpt2')
+        self.gpt = GPT2LMHeadModel.from_pretrained('gpt2').train()
         self.gpt_embedding_size = self.gpt.transformer.wte.weight.shape[1]
         if mapping_type == MappingType.MLP:
             self.clip_project = MLP((prefix_size, (self.gpt_embedding_size * prefix_length) // 2,
@@ -329,6 +330,7 @@ def train(dataset: ClipCocoDataset, model: ClipCaptionModel, args,
             scheduler.step()
             optimizer.zero_grad()
             progress.set_postfix({"loss": loss.item()})
+            wandb.log({'train_loss': loss.item()})
             progress.update()
             if (idx + 1) % 10000 == 0:
                 torch.save(
@@ -357,9 +359,20 @@ def main():
     parser.add_argument('--only_prefix', dest='only_prefix', action='store_true')
     parser.add_argument('--mapping_type', type=str, default='mlp', help='mlp/transformer')
     parser.add_argument('--num_layers', type=int, default=8)
+    parser.add_argument('--tag', default='wo_pre',
+                        help='tag of job, used for wandb and output')
     parser.add_argument('--is_rn', dest='is_rn', action='store_true')
     parser.add_argument('--normalize_prefix', dest='normalize_prefix', action='store_true')
     args = parser.parse_args()
+    wandb.login(key='49222ad51163763788e59460ea91552f32605e38')
+    run = wandb.init(
+        id=args.tag,
+        name=args.tag,
+        entity='buxiangzhiren',
+        project='baseline',
+        job_type='train_model',
+        config=args,
+    )
     prefix_length = args.prefix_length
     dataset = ClipCocoDataset(args.data, prefix_length, normalize_prefix=args.normalize_prefix)
     prefix_dim = 640 if args.is_rn else 512
