@@ -299,7 +299,7 @@ def load_model(config_path: str, epoch_or_latest: Union[str, int] = '_latest'):
 
 
 def train(dataset: ClipCocoDataset, model: ClipCaptionModel, args,
-          lr: float = 2e-5, warmup_steps: int = 5000, output_dir: str = ".", output_prefix: str = ""):
+          lr: float = 2e-4, warmup_steps: int = 5000, output_dir: str = ".", output_prefix: str = ""):
 
     device = torch.device('cuda:0')
     batch_size = args.bs
@@ -329,7 +329,8 @@ def train(dataset: ClipCocoDataset, model: ClipCaptionModel, args,
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad()
-            progress.set_postfix({"loss": loss.item()})
+            progress.set_postfix({"loss": loss.item(),
+                                  'lr': lr})
             wandb.log({'train_loss': loss.item()})
             progress.update()
             if (idx + 1) % 10000 == 0:
