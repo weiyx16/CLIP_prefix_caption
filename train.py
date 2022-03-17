@@ -14,7 +14,7 @@ import argparse
 import json
 from typing import Tuple, Optional, Union
 from clip1 import clip
-
+from clip1.clip import _transform
 import math
 import wandb
 import skimage.io as io1
@@ -58,19 +58,19 @@ class ClipCocoDataset(Dataset):
         image = io1.imread(filename)
         image = Image.fromarray(image)
         image = self.preprocess(image)
-        image_encoding = self.clip_model.encode_image(image.unsqueeze(0))
+        # image_encoding = self.clip_model.encode_image(image.unsqueeze(0))
         prefix = self.prefixes[self.caption2embedding[item]]
         if self.normalize_prefix:
             prefix = prefix.float()
             prefix = prefix / prefix.norm(2, -1)
-        return tokens, mask, prefix, gt, image_encoding.squeeze()
+        return tokens, mask, prefix, gt, image
 
     def __init__(self, data_path: str,  prefix_length: int, gpt2_type: str = "gpt2",
                  normalize_prefix=False):
         self.tokenizer = GPT2Tokenizer.from_pretrained(gpt2_type)
-        self.clip_model, self.preprocess = clip.load("ViT-B/32", device='cpu', jit=False)
         self.prefix_length = prefix_length
         self.normalize_prefix = normalize_prefix
+        self.preprocess = _transform(224)
         with open(data_path, 'rb') as f:
             all_data = pickle.load(f)
         print("Data size is %0d" % len(all_data["clip_embedding"]))
@@ -249,7 +249,7 @@ class ClipCaptionModel(nn.Module):
         bos_toekn_embedding = self.bos_embedding.unsqueeze(0).repeat_interleave(repeats=batch_size, dim=0)
         embedding_text = torch.cat((bos_toekn_embedding.unsqueeze(dim=1), embedding_text[:, 1:, :]), dim=1)
         # prefix_projections = self.clip_project(prefix).view(-1, self.prefix_length, self.gpt_embedding_size)
-        prefix_projections = self.clip_project1(mp)
+        prefix_projections = self.clip_project1(self.image_encode(mp).to(dtype=torch.float32))
         # embedding_cat = torch.cat((prefix_projections, embedding_text), dim=1)
         if labels is not None:
             dummy_token = self.get_dummy_token(tokens.shape[0], tokens.device)
@@ -263,6 +263,9 @@ class ClipCaptionModel(nn.Module):
         self.prefix_length = prefix_length
         self.bos_embedding = nn.Parameter(torch.randn(768))
         self.gpt = GPT2LMHeadModel.from_pretrained('gpt2').train()
+        self.clip_model, _ = clip.load("ViT-B/32", jit=False)
+        self.clip_model.requires_grad_(False)
+        self.image_encode = self.clip_model.encode_image
         self.gpt_embedding_size = self.gpt.transformer.wte.weight.shape[1]
         if mapping_type == MappingType.MLP:
             # self.clip_project = MLP((prefix_size, (self.gpt_embedding_size * prefix_length) // 2,
@@ -323,8 +326,8 @@ def train(dataset: ClipCocoDataset, model: ClipCaptionModel, args,
     epochs = args.epochs
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
-    model = torch.nn.DataParallel(model, device_ids=args.gpus).cuda()
-    # model = model.cuda()
+    # model = torch.nn.DataParallel(model, device_ids=args.gpus).cuda()
+    model = model.cuda()
     model.train()
     optimizer = AdamW(model.parameters(), lr=lr)
     train_dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=True)
@@ -350,7 +353,7 @@ def train(dataset: ClipCocoDataset, model: ClipCaptionModel, args,
             optimizer.zero_grad()
             progress.set_postfix({"loss": loss.item()})
             wandb.log({'train_loss': loss.item(),
-                       'lr': lr})
+                       'loss': lr})
             progress.update()
             if (idx + 1) % 10000 == 0:
                 torch.save(
@@ -375,11 +378,11 @@ def main():
     parser.add_argument('--save_every', type=int, default=5)
     parser.add_argument('--prefix_length', type=int, default=10)
     parser.add_argument('--prefix_length_clip', type=int, default=10)
-    parser.add_argument('--bs', type=int, default=640)
+    parser.add_argument('--bs', type=int, default=80)
     parser.add_argument('--only_prefix', dest='only_prefix', action='store_true')
     parser.add_argument('--mapping_type', type=str, default='mlp', help='mlp/transformer')
     parser.add_argument('--num_layers', type=int, default=8)
-    parser.add_argument('--tag', default='wo_pre_49token_para',
+    parser.add_argument('--tag', default='wo_pre_49token_no_para',
                         help='tag of job, used for wandb and output')
     parser.add_argument('--is_rn', dest='is_rn', action='store_true')
     parser.add_argument('--normalize_prefix', dest='normalize_prefix', action='store_true')
