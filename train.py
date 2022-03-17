@@ -350,7 +350,7 @@ def train(dataset: ClipCocoDataset, model: ClipCaptionModel, args,
             optimizer.zero_grad()
             progress.set_postfix({"loss": loss.item()})
             wandb.log({'train_loss': loss.item(),
-                       'loss': lr})
+                       'lr': lr})
             progress.update()
             if (idx + 1) % 10000 == 0:
                 torch.save(
@@ -379,7 +379,7 @@ def main():
     parser.add_argument('--only_prefix', dest='only_prefix', action='store_true')
     parser.add_argument('--mapping_type', type=str, default='mlp', help='mlp/transformer')
     parser.add_argument('--num_layers', type=int, default=8)
-    parser.add_argument('--tag', default='wo_pre_49token',
+    parser.add_argument('--tag', default='wo_pre_49token_para',
                         help='tag of job, used for wandb and output')
     parser.add_argument('--is_rn', dest='is_rn', action='store_true')
     parser.add_argument('--normalize_prefix', dest='normalize_prefix', action='store_true')
