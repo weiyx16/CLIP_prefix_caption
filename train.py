@@ -52,9 +52,9 @@ class ClipCocoDataset(Dataset):
     def __getitem__(self, item: int) -> Tuple[torch.Tensor, ...]:
         tokens, mask, gt = self.pad_tokens(item)
         img_id = self.image_ids[item]
-        filename = f"/data3/zzx/MSCOCO_Caption/train2014/train2014/COCO_train2014_{int(img_id):012d}.jpg"
+        filename = f"/zzx_vlexp/VQ-Diffusion-my2/MSCOCO_Caption/train2014/COCO_train2014_{int(img_id):012d}.jpg"
         if not os.path.isfile(filename):
-            filename = f"/data3/zzx/MSCOCO_Caption/val2014/val2014/COCO_val2014_{int(img_id):012d}.jpg"
+            filename = f"/zzx_vlexp/VQ-Diffusion-my2/MSCOCO_Caption/val2014/COCO_val2014_{int(img_id):012d}.jpg"
         image = io1.imread(filename)
         image = Image.fromarray(image)
         image = self.preprocess(image)
