@@ -1,3 +1,4 @@
+import os
 import torch
 import torch.nn as nn
 from torch.nn import functional as nnf
@@ -6,14 +7,18 @@ from enum import Enum
 from transformers import GPT2Tokenizer, AdamW, get_linear_schedule_with_warmup
 from tf import GPT2LMHeadModel
 from tqdm import tqdm
-import os
+import io
 import pickle
 import sys
 import argparse
 import json
 from typing import Tuple, Optional, Union
+from clip1 import clip
+
 import math
 import wandb
+import skimage.io as io1
+from PIL import Image
 
 class MappingType(Enum):
     MLP = 'mlp'
@@ -46,15 +51,24 @@ class ClipCocoDataset(Dataset):
 
     def __getitem__(self, item: int) -> Tuple[torch.Tensor, ...]:
         tokens, mask, gt = self.pad_tokens(item)
+        img_id = self.image_ids[item]
+        filename = f"/data3/zzx/MSCOCO_Caption/train2014/train2014/COCO_train2014_{int(img_id):012d}.jpg"
+        if not os.path.isfile(filename):
+            filename = f"/data3/zzx/MSCOCO_Caption/val2014/val2014/COCO_val2014_{int(img_id):012d}.jpg"
+        image = io1.imread(filename)
+        image = Image.fromarray(image)
+        image = self.preprocess(image)
+        image_encoding = self.clip_model.encode_image(image.unsqueeze(0))
         prefix = self.prefixes[self.caption2embedding[item]]
         if self.normalize_prefix:
             prefix = prefix.float()
             prefix = prefix / prefix.norm(2, -1)
-        return tokens, mask, prefix, gt
+        return tokens, mask, prefix, gt, image_encoding.squeeze()
 
     def __init__(self, data_path: str,  prefix_length: int, gpt2_type: str = "gpt2",
                  normalize_prefix=False):
         self.tokenizer = GPT2Tokenizer.from_pretrained(gpt2_type)
+        self.clip_model, self.preprocess = clip.load("ViT-B/32", device='cpu', jit=False)
         self.prefix_length = prefix_length
         self.normalize_prefix = normalize_prefix
         with open(data_path, 'rb') as f:
@@ -228,13 +242,14 @@ class ClipCaptionModel(nn.Module):
     def get_dummy_token(self, batch_size: int, device: torch.device) -> torch.Tensor:
         return torch.zeros(batch_size, self.prefix_length, dtype=torch.int64, device=device)
 
-    def forward(self, tokens: torch.Tensor, prefix: torch.Tensor, mask: Optional[torch.Tensor] = None,
+    def forward(self, tokens: torch.Tensor, prefix: torch.Tensor, mask: Optional[torch.Tensor] = None, mp = None,
                 labels: Optional[torch.Tensor] = None):
         embedding_text = self.gpt.transformer.wte(tokens)
         batch_size = embedding_text.size()[0]
         bos_toekn_embedding = self.bos_embedding.unsqueeze(0).repeat_interleave(repeats=batch_size, dim=0)
         embedding_text = torch.cat((bos_toekn_embedding.unsqueeze(dim=1), embedding_text[:, 1:, :]), dim=1)
-        prefix_projections = self.clip_project(prefix).view(-1, self.prefix_length, self.gpt_embedding_size)
+        # prefix_projections = self.clip_project(prefix).view(-1, self.prefix_length, self.gpt_embedding_size)
+        prefix_projections = self.clip_project1(mp)
         # embedding_cat = torch.cat((prefix_projections, embedding_text), dim=1)
         if labels is not None:
             dummy_token = self.get_dummy_token(tokens.shape[0], tokens.device)
@@ -250,8 +265,10 @@ class ClipCaptionModel(nn.Module):
         self.gpt = GPT2LMHeadModel.from_pretrained('gpt2').train()
         self.gpt_embedding_size = self.gpt.transformer.wte.weight.shape[1]
         if mapping_type == MappingType.MLP:
-            self.clip_project = MLP((prefix_size, (self.gpt_embedding_size * prefix_length) // 2,
-                                     self.gpt_embedding_size * prefix_length))
+            # self.clip_project = MLP((prefix_size, (self.gpt_embedding_size * prefix_length) // 2,
+            #                          self.gpt_embedding_size * prefix_length))
+            self.clip_project1 = MLP((768, self.gpt_embedding_size // 2,
+                                     self.gpt_embedding_size))
         else:
             self.clip_project = TransformerMapper(prefix_size, self.gpt_embedding_size, prefix_length,
                                                                      clip_length, num_layers)
@@ -301,12 +318,13 @@ def load_model(config_path: str, epoch_or_latest: Union[str, int] = '_latest'):
 def train(dataset: ClipCocoDataset, model: ClipCaptionModel, args,
           lr: float = 2e-4, warmup_steps: int = 5000, output_dir: str = ".", output_prefix: str = ""):
 
-    device = torch.device('cuda:0')
+    # device = torch.device('cuda:0')
     batch_size = args.bs
     epochs = args.epochs
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
-    model = model.to(device)
+    model = torch.nn.DataParallel(model, device_ids=args.gpus).cuda()
+    # model = model.cuda()
     model.train()
     optimizer = AdamW(model.parameters(), lr=lr)
     train_dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=True)
@@ -318,10 +336,11 @@ def train(dataset: ClipCocoDataset, model: ClipCaptionModel, args,
         print(f">>> Training epoch {epoch}")
         sys.stdout.flush()
         progress = tqdm(total=len(train_dataloader), desc=output_prefix)
-        for idx, (tokens, mask, prefix, gt) in enumerate(train_dataloader):
+        for idx, (tokens, mask, prefix, gt, mp) in enumerate(train_dataloader):
             model.zero_grad()
-            tokens, mask, prefix, gt = tokens.to(device), mask.to(device), prefix.to(device, dtype=torch.float32), gt.to(device)
-            outputs = model(tokens, prefix, mask)
+            # tokens, mask, prefix, gt = tokens.to(device), mask.to(device), prefix.to(device, dtype=torch.float32), gt.to(device)
+            tokens, mask, prefix, gt, mp = tokens.cuda(), mask.cuda(), prefix.cuda().to(dtype=torch.float32), gt.cuda(), mp.cuda().to(dtype=torch.float32)
+            outputs = model(tokens, prefix, mask, mp)
             # logits = outputs.logits[:, dataset.prefix_length - 1: -1]
             logits = outputs.logits
             loss = nnf.cross_entropy(logits.reshape(-1, logits.shape[-1]), gt.flatten(), ignore_index=0)
@@ -329,9 +348,9 @@ def train(dataset: ClipCocoDataset, model: ClipCaptionModel, args,
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad()
-            progress.set_postfix({"loss": loss.item(),
-                                  'lr': lr})
-            wandb.log({'train_loss': loss.item()})
+            progress.set_postfix({"loss": loss.item()})
+            wandb.log({'train_loss': loss.item(),
+                       'loss': lr})
             progress.update()
             if (idx + 1) % 10000 == 0:
                 torch.save(
@@ -356,14 +375,15 @@ def main():
     parser.add_argument('--save_every', type=int, default=5)
     parser.add_argument('--prefix_length', type=int, default=10)
     parser.add_argument('--prefix_length_clip', type=int, default=10)
-    parser.add_argument('--bs', type=int, default=128)
+    parser.add_argument('--bs', type=int, default=640)
     parser.add_argument('--only_prefix', dest='only_prefix', action='store_true')
     parser.add_argument('--mapping_type', type=str, default='mlp', help='mlp/transformer')
     parser.add_argument('--num_layers', type=int, default=8)
-    parser.add_argument('--tag', default='wo_pre',
+    parser.add_argument('--tag', default='wo_pre_49token',
                         help='tag of job, used for wandb and output')
     parser.add_argument('--is_rn', dest='is_rn', action='store_true')
     parser.add_argument('--normalize_prefix', dest='normalize_prefix', action='store_true')
+    parser.add_argument('--gpus', nargs='+', type=int, default=None)
     args = parser.parse_args()
     wandb.login(key='49222ad51163763788e59460ea91552f32605e38')
     run = wandb.init(
@@ -387,6 +407,8 @@ def main():
                                   num_layers=args.num_layers, mapping_type=args.mapping_type)
         print("Train both prefix and GPT")
         sys.stdout.flush()
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f'{total_params:,} total parameters')
     train(dataset, model, args, output_dir=args.out_dir, output_prefix=args.prefix)
 
 
