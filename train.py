@@ -1,3 +1,6 @@
+import os
+os.environ['MASTER_ADDR'] = 'localhost'
+os.environ['MASTER_PORT'] = '12355'
 import torch
 import torch.nn as nn
 from torch.nn import functional as nnf
@@ -6,7 +9,6 @@ from enum import Enum
 from transformers import GPT2Tokenizer, AdamW, get_linear_schedule_with_warmup
 from tf import GPT2LMHeadModel
 from tqdm import tqdm
-import os
 import pickle
 import sys
 import argparse
@@ -14,10 +16,25 @@ import json
 from typing import Tuple, Optional, Union
 import math
 import wandb
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.multiprocessing as mp
 
 class MappingType(Enum):
     MLP = 'mlp'
     Transformer = 'transformer'
+
+def setup_for_distributed(is_master):
+
+    import builtins as __builtin__
+    builtin_print = __builtin__.print
+
+    def print(*args, **kwargs):
+        force = kwargs.pop('force', False)
+        if is_master or force:
+            builtin_print(*args, **kwargs)
+
+    __builtin__.print = print
 
 
 class ClipCocoDataset(Dataset):
@@ -301,24 +318,37 @@ def load_model(config_path: str, epoch_or_latest: Union[str, int] = '_latest'):
 def train(dataset: ClipCocoDataset, model: ClipCaptionModel, args,
           lr: float = 2e-4, warmup_steps: int = 5000, output_dir: str = ".", output_prefix: str = ""):
 
-    device = torch.device('cuda:0')
+    local_rank = args.local_rank
+    torch.cuda.set_device(local_rank)
+    device = torch.device("cuda", local_rank)
+    # device = torch.device('cuda:0')
     batch_size = args.bs
     epochs = args.epochs
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
     model = model.to(device)
+    model = DDP(model, device_ids=[local_rank], output_device=local_rank)
     model.train()
     optimizer = AdamW(model.parameters(), lr=lr)
-    train_dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=True)
-    scheduler = get_linear_schedule_with_warmup(
-        optimizer, num_warmup_steps=warmup_steps, num_training_steps=epochs * len(train_dataloader)
-    )
+    train_sampler = torch.utils.data.distributed.DistributedSampler(dataset)
+    train_dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, sampler=train_sampler)
+    # train_dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=True)
+    # scheduler = get_linear_schedule_with_warmup(
+    #     optimizer, num_warmup_steps=warmup_steps, num_training_steps=epochs * len(train_dataloader)
+    # )
     # save_config(args)
     for epoch in range(epochs):
+        train_dataloader.sampler.set_epoch(epoch)
         print(f">>> Training epoch {epoch}")
         sys.stdout.flush()
         progress = tqdm(total=len(train_dataloader), desc=output_prefix)
         for idx, (tokens, mask, prefix, gt) in enumerate(train_dataloader):
+            if epoch + 1 == 10:
+                for p in optimizer.param_groups:
+                    p['lr'] *= 2
+            if epoch + 1 == 20:
+                for p in optimizer.param_groups:
+                    p['lr'] *= 0.25
             model.zero_grad()
             tokens, mask, prefix, gt = tokens.to(device), mask.to(device), prefix.to(device, dtype=torch.float32), gt.to(device)
             outputs = model(tokens, prefix, mask)
@@ -327,32 +357,37 @@ def train(dataset: ClipCocoDataset, model: ClipCaptionModel, args,
             loss = nnf.cross_entropy(logits.reshape(-1, logits.shape[-1]), gt.flatten(), ignore_index=0)
             loss.backward()
             optimizer.step()
-            scheduler.step()
+            # scheduler.step()
             optimizer.zero_grad()
-            progress.set_postfix({"loss": loss.item(),
-                                  'lr': lr})
-            wandb.log({'train_loss': loss.item()})
+            progress.set_postfix({"loss": loss.item()})
+            if dist.get_rank() == 0:
+                wandb.log({'train_loss': loss.item(),
+                           'lr': optimizer.param_groups[0]['lr']})
             progress.update()
-            if (idx + 1) % 10000 == 0:
+            if (idx + 1) % 10000 == 0 and dist.get_rank() == 0:
                 torch.save(
-                    model.state_dict(),
+                    model.module.state_dict(),
                     os.path.join(output_dir, f"{output_prefix}_latest.pt"),
                 )
         progress.close()
         if epoch % args.save_every == 0 or epoch == epochs - 1:
-            torch.save(
-                model.state_dict(),
-                os.path.join(output_dir, f"{output_prefix}-{epoch:03d}.pt"),
-            )
+            if dist.get_rank() == 0:
+                torch.save(
+                    model.module.state_dict(),
+                    os.path.join(output_dir, f"{output_prefix}-{epoch:03d}.pt"),
+                )
     return model
 
 
-def main():
+def main(local_rank, world_size):
+    dist.init_process_group("nccl", rank=local_rank, world_size=world_size)
+    torch.distributed.barrier()
+    setup_for_distributed(local_rank == 0) ##### HERE
     parser = argparse.ArgumentParser()
     parser.add_argument('--data', default='./data/coco/oscar_split_train.pkl')
     parser.add_argument('--out_dir', default='./checkpoints')
     parser.add_argument('--prefix', default='coco_prefix', help='prefix for saved filenames')
-    parser.add_argument('--epochs', type=int, default=80)
+    parser.add_argument('--epochs', type=int, default=30)
     parser.add_argument('--save_every', type=int, default=5)
     parser.add_argument('--prefix_length', type=int, default=10)
     parser.add_argument('--prefix_length_clip', type=int, default=10)
@@ -360,20 +395,23 @@ def main():
     parser.add_argument('--only_prefix', dest='only_prefix', action='store_true')
     parser.add_argument('--mapping_type', type=str, default='mlp', help='mlp/transformer')
     parser.add_argument('--num_layers', type=int, default=8)
-    parser.add_argument('--tag', default='wo_pre',
+    parser.add_argument('--tag', default='wo_pre_linearlr',
                         help='tag of job, used for wandb and output')
     parser.add_argument('--is_rn', dest='is_rn', action='store_true')
     parser.add_argument('--normalize_prefix', dest='normalize_prefix', action='store_true')
+    parser.add_argument("--local_rank", default=-1)
     args = parser.parse_args()
-    wandb.login(key='49222ad51163763788e59460ea91552f32605e38')
-    run = wandb.init(
-        id=args.tag,
-        name=args.tag,
-        entity='buxiangzhiren',
-        project='baseline',
-        job_type='train_model',
-        config=args,
-    )
+    args.local_rank = local_rank
+    if dist.get_rank() == 0:
+        wandb.login(key='49222ad51163763788e59460ea91552f32605e38')
+        run = wandb.init(
+            id=args.tag,
+            name=args.tag,
+            entity='buxiangzhiren',
+            project='baseline',
+            job_type='train_model',
+            config=args,
+        )
     prefix_length = args.prefix_length
     dataset = ClipCocoDataset(args.data, prefix_length, normalize_prefix=args.normalize_prefix)
     prefix_dim = 640 if args.is_rn else 512
@@ -393,4 +431,8 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    world_size = 8
+    mp.spawn(main,
+        args=(world_size,),
+        nprocs=world_size,
+        join=True)
