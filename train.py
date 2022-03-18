@@ -251,7 +251,8 @@ class ClipCaptionModel(nn.Module):
         batch_size = embedding_text.size()[0]
         bos_toekn_embedding = self.bos_embedding.unsqueeze(0).repeat_interleave(repeats=batch_size, dim=0)
         embedding_text = torch.cat((bos_toekn_embedding.unsqueeze(dim=1), embedding_text[:, 1:, :]), dim=1)
-        prefix_projections = self.clip_project(prefix).view(-1, self.prefix_length, self.gpt_embedding_size)
+        # prefix_projections = self.clip_project(prefix).view(-1, self.prefix_length, self.gpt_embedding_size)
+        prefix_projections = self.clip_project(prefix)
         # embedding_cat = torch.cat((prefix_projections, embedding_text), dim=1)
         if labels is not None:
             dummy_token = self.get_dummy_token(tokens.shape[0], tokens.device)
@@ -267,8 +268,10 @@ class ClipCaptionModel(nn.Module):
         self.gpt = GPT2LMHeadModel.from_pretrained('gpt2').train()
         self.gpt_embedding_size = self.gpt.transformer.wte.weight.shape[1]
         if mapping_type == MappingType.MLP:
-            self.clip_project = MLP((prefix_size, (self.gpt_embedding_size * prefix_length) // 2,
-                                     self.gpt_embedding_size * prefix_length))
+            # self.clip_project = MLP((prefix_size, (self.gpt_embedding_size * prefix_length) // 2,
+            #                          self.gpt_embedding_size * prefix_length))
+            self.clip_project = MLP((768, self.gpt_embedding_size // 2,
+                                     self.gpt_embedding_size))
         else:
             self.clip_project = TransformerMapper(prefix_size, self.gpt_embedding_size, prefix_length,
                                                                      clip_length, num_layers)
@@ -395,7 +398,7 @@ def main(local_rank, world_size):
     parser.add_argument('--only_prefix', dest='only_prefix', action='store_true')
     parser.add_argument('--mapping_type', type=str, default='mlp', help='mlp/transformer')
     parser.add_argument('--num_layers', type=int, default=8)
-    parser.add_argument('--tag', default='wo_pre_linearlr',
+    parser.add_argument('--tag', default='wo_pre_linearlr_49token',
                         help='tag of job, used for wandb and output')
     parser.add_argument('--is_rn', dest='is_rn', action='store_true')
     parser.add_argument('--normalize_prefix', dest='normalize_prefix', action='store_true')
