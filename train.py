@@ -251,8 +251,7 @@ class ClipCaptionModel(nn.Module):
         batch_size = embedding_text.size()[0]
         bos_toekn_embedding = self.bos_embedding.unsqueeze(0).repeat_interleave(repeats=batch_size, dim=0)
         embedding_text = torch.cat((bos_toekn_embedding.unsqueeze(dim=1), embedding_text[:, 1:, :]), dim=1)
-        # prefix_projections = self.clip_project(prefix).view(-1, self.prefix_length, self.gpt_embedding_size)
-        prefix_projections = self.clip_project(prefix)
+        prefix_projections = self.clip_project(prefix).view(-1, self.prefix_length, self.gpt_embedding_size)
         # embedding_cat = torch.cat((prefix_projections, embedding_text), dim=1)
         if labels is not None:
             dummy_token = self.get_dummy_token(tokens.shape[0], tokens.device)
@@ -268,10 +267,8 @@ class ClipCaptionModel(nn.Module):
         self.gpt = GPT2LMHeadModel.from_pretrained('gpt2').train()
         self.gpt_embedding_size = self.gpt.transformer.wte.weight.shape[1]
         if mapping_type == MappingType.MLP:
-            # self.clip_project = MLP((prefix_size, (self.gpt_embedding_size * prefix_length) // 2,
-            #                          self.gpt_embedding_size * prefix_length))
-            self.clip_project = MLP((768, self.gpt_embedding_size // 2,
-                                     self.gpt_embedding_size))
+            self.clip_project = MLP((prefix_size, (self.gpt_embedding_size * prefix_length) // 2,
+                                     self.gpt_embedding_size * prefix_length))
         else:
             self.clip_project = TransformerMapper(prefix_size, self.gpt_embedding_size, prefix_length,
                                                                      clip_length, num_layers)
@@ -319,7 +316,7 @@ def load_model(config_path: str, epoch_or_latest: Union[str, int] = '_latest'):
 
 
 def train(dataset: ClipCocoDataset, model: ClipCaptionModel, args,
-          lr: float = 2e-4, warmup_steps: int = 5000, output_dir: str = ".", output_prefix: str = ""):
+          lr: float = 1e-4, warmup_steps: int = 5000, output_dir: str = ".", output_prefix: str = ""):
 
     local_rank = args.local_rank
     torch.cuda.set_device(local_rank)
@@ -348,10 +345,10 @@ def train(dataset: ClipCocoDataset, model: ClipCaptionModel, args,
         for idx, (tokens, mask, prefix, gt) in enumerate(train_dataloader):
             if epoch + 1 == 10:
                 for p in optimizer.param_groups:
-                    p['lr'] *= 2
+                    p['lr'] = 0.0002
             if epoch + 1 == 20:
                 for p in optimizer.param_groups:
-                    p['lr'] *= 0.25
+                    p['lr'] = 0.00005
             model.zero_grad()
             tokens, mask, prefix, gt = tokens.to(device), mask.to(device), prefix.to(device, dtype=torch.float32), gt.to(device)
             outputs = model(tokens, prefix, mask)
@@ -362,7 +359,7 @@ def train(dataset: ClipCocoDataset, model: ClipCaptionModel, args,
             optimizer.step()
             # scheduler.step()
             optimizer.zero_grad()
-            progress.set_postfix({"loss": loss.item()})
+            progress.set_postfix({"loss": loss.item(), 'lr': optimizer.param_groups[0]['lr']})
             if dist.get_rank() == 0:
                 wandb.log({'train_loss': loss.item(),
                            'lr': optimizer.param_groups[0]['lr']})
@@ -390,15 +387,15 @@ def main(local_rank, world_size):
     parser.add_argument('--data', default='./data/coco/oscar_split_train.pkl')
     parser.add_argument('--out_dir', default='./checkpoints')
     parser.add_argument('--prefix', default='coco_prefix', help='prefix for saved filenames')
-    parser.add_argument('--epochs', type=int, default=30)
-    parser.add_argument('--save_every', type=int, default=5)
+    parser.add_argument('--epochs', type=int, default=80)
+    parser.add_argument('--save_every', type=int, default=1)
     parser.add_argument('--prefix_length', type=int, default=10)
     parser.add_argument('--prefix_length_clip', type=int, default=10)
     parser.add_argument('--bs', type=int, default=128)
     parser.add_argument('--only_prefix', dest='only_prefix', action='store_true')
     parser.add_argument('--mapping_type', type=str, default='mlp', help='mlp/transformer')
     parser.add_argument('--num_layers', type=int, default=8)
-    parser.add_argument('--tag', default='wo_pre_linearlr_49token',
+    parser.add_argument('--tag', default='wo_pre_linearlr',
                         help='tag of job, used for wandb and output')
     parser.add_argument('--is_rn', dest='is_rn', action='store_true')
     parser.add_argument('--normalize_prefix', dest='normalize_prefix', action='store_true')
