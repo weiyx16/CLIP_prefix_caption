@@ -7,6 +7,7 @@ from torch.nn import functional as nnf
 from torch.utils.data import Dataset, DataLoader
 from enum import Enum
 from transformers import GPT2Tokenizer, AdamW, get_linear_schedule_with_warmup
+from transformers.models.gpt2.configuration_gpt2 import GPT2Config
 from tf import GPT2LMHeadModel
 from tqdm import tqdm
 import io
@@ -26,6 +27,7 @@ import skimage.io as io1
 from PIL import Image
 from PIL import ImageFile
 ImageFile.LOAD_TRUNCATED_IMAGES = True
+import numpy as np
 
 class MappingType(Enum):
     MLP = 'mlp'
@@ -50,44 +52,38 @@ class ClipCocoDataset(Dataset):
         return len(self.captions_tokens)
 
     def pad_tokens(self, item: int):
+        # notice the endoftext in tokens is just used as placehold, will be replaced by a learnable bos embedding
         tokens = torch.cat((torch.tensor(self.tokenizer.encode('<|endoftext|>')), self.captions_tokens[item]), dim=0)
         gt = torch.cat((self.captions_tokens[item], torch.tensor(self.tokenizer.encode('<|endoftext|>'))), dim=0)
         padding = self.max_seq_len - tokens.shape[0]
         if padding > 0:
             tokens = torch.cat((tokens, torch.zeros(padding, dtype=torch.int64) - 1))
-            gt = torch.cat((gt, torch.zeros(padding, dtype=torch.int64) - 1))
+            gt = torch.cat((gt, torch.zeros(padding, dtype=torch.int64) - 1))  # we set target == -1 as ignore target
         elif padding < 0:
             tokens = tokens[:self.max_seq_len]
             gt = gt[:self.max_seq_len]
-        mask = tokens.ge(0)
-        mask1 = gt.ge(0) # mask is zero where we out of sequence
-        assert mask.equal(mask1)
+        mask = tokens.ge(0) # mask is zero where we out of sequence
         tokens[~mask] = 0
-        gt[~mask1] = 0
         mask = mask.float()
-        # mask = torch.cat((torch.ones(self.prefix_length), mask), dim=0)  # adding prefix mask
         return tokens, mask, gt
 
     def __getitem__(self, item: int) -> Tuple[torch.Tensor, ...]:
         tokens, mask, gt = self.pad_tokens(item)
         img_id = self.image_ids[item]
-        filename = f"/zzx_vlexp/VQ-Diffusion-my2/MSCOCO_Caption/train2014/COCO_train2014_{int(img_id):012d}.jpg"
-        if not os.path.isfile(filename):
-            filename = f"/zzx_vlexp/VQ-Diffusion-my2/MSCOCO_Caption/val2014/COCO_val2014_{int(img_id):012d}.jpg"
+        filename = f"{self.data_root}/train2014/COCO_train2014_{int(img_id):012d}.jpg"
         image = io1.imread(filename)
         image = Image.fromarray(image)
         image = self.preprocess(image)
-        # image_encoding = self.clip_model.encode_image(image.unsqueeze(0))
+        ## this is for pre-computed clip feature
         prefix = self.prefixes[self.caption2embedding[item]]
         if self.normalize_prefix:
             prefix = prefix.float()
             prefix = prefix / prefix.norm(2, -1)
         return tokens, mask, image, gt
 
-    def __init__(self, data_path: str,  prefix_length: int, gpt2_type: str = "gpt2",
-                 normalize_prefix=False):
+    def __init__(self, data_root: str, data_path: str,  gpt2_type: str = "gpt2", normalize_prefix=False):
+        self.data_root = data_root
         self.tokenizer = GPT2Tokenizer.from_pretrained(gpt2_type)
-        self.prefix_length = prefix_length
         self.normalize_prefix = normalize_prefix
         self.preprocess = _transform(224)
         with open(data_path, 'rb') as f:
@@ -107,12 +103,13 @@ class ClipCocoDataset(Dataset):
             max_seq_len = 0
             for caption in captions_raw:
                 self.captions_tokens.append(torch.tensor(self.tokenizer.encode(caption['caption']), dtype=torch.int64))
-                self.caption2embedding.append(caption["clip_embedding"])
+                self.caption2embedding.append(caption["clip_embedding"]) # just index
                 max_seq_len = max(max_seq_len, self.captions_tokens[-1].shape[0])
             # self.max_seq_len = max_seq_len
             with open(f"{data_path[:-4]}_tokens.pkl", 'wb') as f:
                 pickle.dump([self.captions_tokens, self.caption2embedding, max_seq_len], f)
         all_len = torch.tensor([len(self.captions_tokens[i]) for i in range(len(self))]).float()
+        ## notice current one is 40
         self.max_seq_len = min(int(all_len.mean() + all_len.std() * 10), int(all_len.max()))
 
 
@@ -263,13 +260,15 @@ class ClipCaptionModel(nn.Module):
 
     def forward(self, tokens: torch.Tensor, prefix: torch.Tensor, mask: Optional[torch.Tensor] = None,
                 labels: Optional[torch.Tensor] = None):
+        self.clip_model.eval()
         embedding_text = self.gpt.transformer.wte(tokens)
         batch_size = embedding_text.size()[0]
-        bos_toekn_embedding = self.bos_embedding.unsqueeze(0).repeat_interleave(repeats=batch_size, dim=0)
-        embedding_text = torch.cat((bos_toekn_embedding.unsqueeze(dim=1), embedding_text[:, 1:, :]), dim=1)
+        bos_token_embedding = self.bos_embedding.unsqueeze(0).unsqueeze(0).repeat_interleave(repeats=batch_size, dim=0)
+        embedding_text = torch.cat((bos_token_embedding, embedding_text[:, 1:, :]), dim=1)
         # prefix_projections = self.clip_project(prefix).view(-1, self.prefix_length, self.gpt_embedding_size)
-        prefix_projections = self.clip_project(self.image_encode(prefix).to(dtype=torch.float32))
-        # embedding_cat = torch.cat((prefix_projections, embedding_text), dim=1)
+        with torch.no_grad():
+            prefix = self.image_encode(prefix)
+        prefix_projections = self.clip_project(prefix.to(dtype=torch.float32))
         if labels is not None:
             dummy_token = self.get_dummy_token(tokens.shape[0], tokens.device)
             labels = torch.cat((dummy_token, tokens), dim=1)
@@ -280,15 +279,19 @@ class ClipCaptionModel(nn.Module):
                  num_layers: int = 8, mapping_type: MappingType = MappingType.MLP):
         super(ClipCaptionModel, self).__init__()
         self.prefix_length = prefix_length
-        self.bos_embedding = nn.Parameter(torch.randn(768))
-        self.gpt = GPT2LMHeadModel.from_pretrained('gpt2').train()
-        self.clip_model, _ = clip.load("ViT-B/32", jit=False)
+        # self.gpt = GPT2LMHeadModel.from_pretrained('gpt2')
+        configuration = GPT2Config.from_pretrained('gpt2')
+        configuration = configuration.__dict__.copy()
+        configuration.update({'scale_attn_by_inverse_layer_idx': False})
+        configuration.update({'reorder_and_upcast_attn': False})
+        configuration = GPT2Config(**configuration)
+        self.gpt = GPT2LMHeadModel(configuration)
+        self.clip_model, _ = clip.load("ViT-B/32", device='cpu', jit=False)
         self.clip_model.requires_grad_(False)
         self.image_encode = self.clip_model.encode_image
         self.gpt_embedding_size = self.gpt.transformer.wte.weight.shape[1]
+        self.bos_embedding = nn.Parameter(torch.randn(self.gpt_embedding_size))
         if mapping_type == MappingType.MLP:
-            # self.clip_project = MLP((prefix_size, (self.gpt_embedding_size * prefix_length) // 2,
-            #                          self.gpt_embedding_size * prefix_length))
             self.clip_project = MLP((768, self.gpt_embedding_size // 2,
                                      self.gpt_embedding_size ))
         else:
@@ -311,7 +314,7 @@ def save_config(args: argparse.Namespace):
     config = {}
     for key, item in args._get_kwargs():
         config[key] = item
-    out_path = os.path.join(args.out_dir, f"{args.prefix}.json")
+    out_path = os.path.join(args.out_dir, f"{args.tag}.json")
     with open(out_path, 'w') as outfile:
         json.dump(config, outfile)
 
@@ -324,7 +327,7 @@ def load_model(config_path: str, epoch_or_latest: Union[str, int] = '_latest'):
     args = parser.parse_args()
     if type(epoch_or_latest) is int:
         epoch_or_latest = f"-{epoch_or_latest:03d}"
-    model_path = os.path.join(args.out_dir, f"{args.prefix}{epoch_or_latest}.pt")
+    model_path = os.path.join(args.out_dir, f"{args.tag}{epoch_or_latest}.pt")
     if args.only_prefix:
         model = ClipCaptionPrefix(args.prefix_length)
     else:
@@ -336,51 +339,70 @@ def load_model(config_path: str, epoch_or_latest: Union[str, int] = '_latest'):
         print(f"{model_path} is not exist")
     return model, parser
 
+def check_keywords_in_name(name, keywords=()):
+    isin = False
+    for keyword in keywords:
+        if keyword in name:
+            isin = True
+    return isin
+
+def get_pretrain_param_groups(model, skip_list=(), skip_keywords=()):
+    has_decay = []
+    no_decay = []
+    has_decay_name = []
+    no_decay_name = []
+    
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if len(param.shape) == 1 or name.endswith(".bias") or (name in skip_list) or \
+                check_keywords_in_name(name, skip_keywords):
+            no_decay.append(param)
+            no_decay_name.append(name)
+        else:
+            has_decay.append(param)
+            has_decay_name.append(name)
+    print(f'No decay params: {no_decay_name}')
+    print(f'Has decay params: {has_decay_name}')
+    return [{'params': has_decay},
+            {'params': no_decay, 'weight_decay': 0.}]
+
 
 def train(dataset: ClipCocoDataset, model: ClipCaptionModel, args,
-          lr: float = 1e-4, warmup_steps: int = 5000, output_dir: str = ".", output_prefix: str = ""):
+          warmup_steps: int = 5000, output_dir: str = ".", output_prefix: str = ""):
 
     local_rank = args.local_rank
     torch.cuda.set_device(local_rank)
-    device = torch.device("cuda", local_rank)
-    # device = torch.device('cuda:0')
     batch_size = args.bs
     epochs = args.epochs
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
-    model = model.to(device)
-    model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+    model = model.cuda()
+    model = DDP(model, device_ids=[local_rank], broadcast_buffers=False)
     model.train()
-    optimizer = AdamW(model.parameters(), lr=lr)
+    parameters = get_pretrain_param_groups(model)
+    optimizer = AdamW(parameters, lr=args.lr, weight_decay=args.wd)
     train_sampler = torch.utils.data.distributed.DistributedSampler(dataset)
-    train_dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, sampler=train_sampler)
-    # train_dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=True)
-    # scheduler = get_linear_schedule_with_warmup(
-    #     optimizer, num_warmup_steps=warmup_steps, num_training_steps=epochs * len(train_dataloader)
-    # )
-    # save_config(args)
+    train_dataloader = DataLoader(dataset, batch_size=batch_size, sampler=train_sampler)
     for epoch in range(epochs):
         train_dataloader.sampler.set_epoch(epoch)
         print(f">>> Training epoch {epoch}")
         sys.stdout.flush()
         progress = tqdm(total=len(train_dataloader), desc=output_prefix)
         for idx, (tokens, mask, prefix, gt) in enumerate(train_dataloader):
-            if epoch + 1 == 10:
-                for p in optimizer.param_groups:
-                    p['lr'] = 0.0002
-            if epoch + 1 == 20:
-                for p in optimizer.param_groups:
-                    p['lr'] = 0.00005
-            model.zero_grad()
-            tokens, mask, prefix, gt = tokens.to(device), mask.to(device), prefix.to(device, dtype=torch.float32), gt.to(device)
+            tokens = tokens.cuda(non_blocking=True)
+            mask = mask.cuda(non_blocking=True)
+            prefix = prefix.cuda(non_blocking=True)
+            gt = gt.cuda(non_blocking=True)
             outputs = model(tokens, prefix, mask)
-            # logits = outputs.logits[:, dataset.prefix_length - 1: -1]
             logits = outputs.logits
-            loss = nnf.cross_entropy(logits.reshape(-1, logits.shape[-1]), gt.flatten(), ignore_index=0)
+            # FIXME: is this ignore_index correct? 0 is ! in vocab
+            loss = nnf.cross_entropy(logits.reshape(-1, logits.shape[-1]), gt.flatten(), ignore_index=-1)
             loss.backward()
             optimizer.step()
             # scheduler.step()
             optimizer.zero_grad()
+            torch.cuda.synchronize()
             progress.set_postfix({"loss": loss.item(), 'lr': optimizer.param_groups[0]['lr']})
             if dist.get_rank() == 0:
                 wandb.log({'train_loss': loss.item(),
@@ -407,13 +429,15 @@ def main(local_rank, world_size):
     setup_for_distributed(local_rank == 0) ##### HERE
     parser = argparse.ArgumentParser()
     parser.add_argument('--data', default='./data/coco/oscar_split_train.pkl')
+    parser.add_argument('--data_root', help='raw coco training image path')
     parser.add_argument('--out_dir', default='./checkpoints')
-    parser.add_argument('--prefix', default='coco_prefix', help='prefix for saved filenames')
     parser.add_argument('--epochs', type=int, default=30)
     parser.add_argument('--save_every', type=int, default=5)
     parser.add_argument('--prefix_length', type=int, default=10)
     parser.add_argument('--prefix_length_clip', type=int, default=10)
     parser.add_argument('--bs', type=int, default=128)
+    parser.add_argument('--lr', type=float, default=1e-4)
+    parser.add_argument('--wd', type=int, default=0.01)
     parser.add_argument('--only_prefix', dest='only_prefix', action='store_true')
     parser.add_argument('--mapping_type', type=str, default='mlp', help='mlp/transformer')
     parser.add_argument('--num_layers', type=int, default=8)
@@ -424,6 +448,9 @@ def main(local_rank, world_size):
     parser.add_argument("--local_rank", default=-1)
     args = parser.parse_args()
     args.local_rank = local_rank
+    args.out_dir = os.path.join(args.out_dir, args.tag)
+    os.makedirs(args.out_dir, exist_ok=True)
+    save_config(args)
     if dist.get_rank() == 0:
         wandb.login(key='49222ad51163763788e59460ea91552f32605e38')
         run = wandb.init(
@@ -435,7 +462,7 @@ def main(local_rank, world_size):
             config=args,
         )
     prefix_length = args.prefix_length
-    dataset = ClipCocoDataset(args.data, prefix_length, normalize_prefix=args.normalize_prefix)
+    dataset = ClipCocoDataset(args.data_root, args.data, normalize_prefix=args.normalize_prefix)
     prefix_dim = 640 if args.is_rn else 512
     args.mapping_type = {'mlp': MappingType.MLP, 'transformer': MappingType.Transformer}[args.mapping_type]
     if args.only_prefix:
@@ -447,9 +474,9 @@ def main(local_rank, world_size):
                                   num_layers=args.num_layers, mapping_type=args.mapping_type)
         print("Train both prefix and GPT")
         sys.stdout.flush()
-    total_params = sum(p.numel() for p in model.parameters())
+    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f'{total_params:,} total parameters')
-    train(dataset, model, args, output_dir=args.out_dir, output_prefix=args.prefix)
+    train(dataset, model, args, output_dir=args.out_dir, output_prefix=args.tag)
 
 
 if __name__ == '__main__':

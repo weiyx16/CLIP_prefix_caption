@@ -32,7 +32,7 @@ from transformers.modeling_outputs import (
 )
 from transformers.modeling_utils import (
     Conv1D,
-    # PreTrainedModel,
+    PreTrainedModel,
     SequenceSummary,
     find_pruneable_heads_and_indices,
     prune_conv1d_layer,
@@ -40,7 +40,7 @@ from transformers.modeling_utils import (
 from transformers.utils import logging
 from transformers.utils.model_parallel_utils import assert_device_map, get_device_map
 from transformers.models.gpt2.configuration_gpt2 import GPT2Config
-from fix_pre import PreTrainedModel
+# from fix_pre import PreTrainedModel
 
 logger = logging.get_logger(__name__)
 
@@ -470,6 +470,31 @@ class GPT2PreTrainedModel(PreTrainedModel):
         if isinstance(module, GPT2Model):
             module.gradient_checkpointing = value
 
+    def post_init(self):
+        """
+        A method executed at the end of each Transformer model initialization, to execute code that needs the model's
+        modules properly initialized (such as weight initialization).
+        """
+        self.init_weights()
+        self._backward_compatibility_gradient_checkpointing()
+        
+    def _backward_compatibility_gradient_checkpointing(self):
+        if self.supports_gradient_checkpointing and getattr(self.config, "gradient_checkpointing", False):
+            self.gradient_checkpointing_enable()
+            # Remove the attribute now that is has been consumed, so it's no saved in the config.
+            delattr(self.config, "gradient_checkpointing")
+
+    def gradient_checkpointing_enable(self):
+        """
+        Activates gradient checkpointing for the current model.
+        Note that in other frameworks this feature can be referred to as "activation checkpointing" or "checkpoint
+        activations".
+        """
+        from functools import partial
+        if not self.supports_gradient_checkpointing:
+            raise ValueError(f"{self.__class__.__name__} does not support gradient checkpointing.")
+        self.apply(partial(self._set_gradient_checkpointing, value=True))
+
 
 @dataclass
 class GPT2DoubleHeadsModelOutput(ModelOutput):
@@ -692,13 +717,13 @@ class GPT2Model(GPT2PreTrainedModel):
         for layer, heads in heads_to_prune.items():
             self.h[layer].attn.prune_heads(heads)
 
-    @add_start_docstrings_to_model_forward(GPT2_INPUTS_DOCSTRING)
-    @add_code_sample_docstrings(
-        processor_class=_TOKENIZER_FOR_DOC,
-        checkpoint=_CHECKPOINT_FOR_DOC,
-        output_type=BaseModelOutputWithPastAndCrossAttentions,
-        config_class=_CONFIG_FOR_DOC,
-    )
+    # @add_start_docstrings_to_model_forward(GPT2_INPUTS_DOCSTRING)
+    # @add_code_sample_docstrings(
+    #     processor_class=_TOKENIZER_FOR_DOC,
+    #     checkpoint=_CHECKPOINT_FOR_DOC,
+    #     output_type=BaseModelOutputWithPastAndCrossAttentions,
+    #     config_class=_CONFIG_FOR_DOC,
+    # )
     def forward(
         self,
         input_ids=None,
@@ -971,13 +996,13 @@ class GPT2LMHeadModel(GPT2PreTrainedModel):
             "token_type_ids": token_type_ids,
         }
 
-    @add_start_docstrings_to_model_forward(GPT2_INPUTS_DOCSTRING)
-    @add_code_sample_docstrings(
-        processor_class=_TOKENIZER_FOR_DOC,
-        checkpoint=_CHECKPOINT_FOR_DOC,
-        output_type=CausalLMOutputWithCrossAttentions,
-        config_class=_CONFIG_FOR_DOC,
-    )
+    # @add_start_docstrings_to_model_forward(GPT2_INPUTS_DOCSTRING)
+    # @add_code_sample_docstrings(
+    #     processor_class=_TOKENIZER_FOR_DOC,
+    #     checkpoint=_CHECKPOINT_FOR_DOC,
+    #     output_type=CausalLMOutputWithCrossAttentions,
+    #     config_class=_CONFIG_FOR_DOC,
+    # )
     def forward(
         self,
         input_ids=None,
@@ -1292,13 +1317,13 @@ class GPT2ForSequenceClassification(GPT2PreTrainedModel):
         # Initialize weights and apply final processing
         self.post_init()
 
-    @add_start_docstrings_to_model_forward(GPT2_INPUTS_DOCSTRING)
-    @add_code_sample_docstrings(
-        processor_class=_TOKENIZER_FOR_DOC,
-        checkpoint="microsoft/DialogRPT-updown",
-        output_type=SequenceClassifierOutputWithPast,
-        config_class=_CONFIG_FOR_DOC,
-    )
+    # @add_start_docstrings_to_model_forward(GPT2_INPUTS_DOCSTRING)
+    # @add_code_sample_docstrings(
+    #     processor_class=_TOKENIZER_FOR_DOC,
+    #     checkpoint="microsoft/DialogRPT-updown",
+    #     output_type=SequenceClassifierOutputWithPast,
+    #     config_class=_CONFIG_FOR_DOC,
+    # )
     def forward(
         self,
         input_ids=None,
@@ -1424,13 +1449,13 @@ class GPT2ForTokenClassification(GPT2PreTrainedModel):
         # Initialize weights and apply final processing
         self.post_init()
 
-    @add_start_docstrings_to_model_forward(GPT2_INPUTS_DOCSTRING)
-    @add_code_sample_docstrings(
-        processor_class=_TOKENIZER_FOR_DOC,
-        checkpoint="microsoft/DialogRPT-updown",
-        output_type=TokenClassifierOutput,
-        config_class=_CONFIG_FOR_DOC,
-    )
+    # @add_start_docstrings_to_model_forward(GPT2_INPUTS_DOCSTRING)
+    # @add_code_sample_docstrings(
+    #     processor_class=_TOKENIZER_FOR_DOC,
+    #     checkpoint="microsoft/DialogRPT-updown",
+    #     output_type=TokenClassifierOutput,
+    #     config_class=_CONFIG_FOR_DOC,
+    # )
     def forward(
         self,
         input_ids=None,

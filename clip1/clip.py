@@ -10,6 +10,7 @@ from torchvision.transforms import Compose, Resize, CenterCrop, ToTensor, Normal
 from tqdm import tqdm
 
 from .model import build_model
+import torch.distributed as dist
 from .simple_tokenizer import SimpleTokenizer as _Tokenizer
 
 __all__ = ["available_models", "load", "tokenize"]
@@ -26,8 +27,7 @@ def _download(url: str, root: str = os.path.expanduser("~/.cache/image-synthesis
     filename = os.path.basename(url)
 
     expected_sha256 = url.split("/")[-2]
-    # download_target = os.path.join(root, filename)
-    download_target = "/zzx_vlexp/VQ-Diffusion-my2/OUTPUT/pretrained_model/ViT-B-32.pt"
+    download_target = os.path.join(root, filename)
 
     if os.path.exists(download_target) and not os.path.isfile(download_target):
         raise RuntimeError(f"{download_target} exists and is not a regular file")
@@ -92,8 +92,10 @@ def load(name: str, device: Union[str, torch.device] = "cuda" if torch.cuda.is_a
         A torchvision transform that converts a PIL image into a tensor that the returned model can take as its input
     """
     if name in _MODELS:
-        # model_path = _download(_MODELS[name])
-        model_path = "/zzx_vlexp/VQ-Diffusion-my2/OUTPUT/pretrained_model/ViT-B-32.pt"
+        if ((dist.is_initialized() or dist.is_available()) and int(dist.get_rank()) == 0) or not dist.is_available():
+            model_path = _download(_MODELS[name])
+        dist.barrier()
+        model_path = _download(_MODELS[name])
     elif os.path.isfile(name):
         model_path = name
     else:
