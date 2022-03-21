@@ -3,6 +3,8 @@ os.environ['MASTER_ADDR'] = 'localhost'
 os.environ['MASTER_PORT'] = '12355'
 import torch
 import torch.nn as nn
+import torch.backends.cudnn as cudnn
+import torch.cuda.amp as amp
 from torch.nn import functional as nnf
 from torch.utils.data import Dataset, DataLoader
 from enum import Enum
