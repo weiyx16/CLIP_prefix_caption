@@ -334,7 +334,7 @@ def load_model(config_path: str, epoch_or_latest: Union[str, int] = '_latest'):
         model = ClipCaptionModel(args.prefix_length)
     if os.path.isfile(model_path):
         print(f"loading model from {model_path}")
-        model.load_state_dict(torch.load(model_path, map_location=torch.device('cpu')))
+        model.load_state_dict(torch.load(model_path, map_location=torch.device('cpu'))["model"])
     else:
         print(f"{model_path} is not exist")
     return model, parser
@@ -384,6 +384,11 @@ def train(dataset: ClipCocoDataset, model: ClipCaptionModel, args,
     optimizer = AdamW(parameters, lr=args.lr, weight_decay=args.wd)
     train_sampler = torch.utils.data.distributed.DistributedSampler(dataset)
     train_dataloader = DataLoader(dataset, batch_size=batch_size, sampler=train_sampler, num_workers=8, pin_memory=True, drop_last=True)
+    
+    num_steps = len(train_dataloader)
+    lr_args = {"LR_SCHEDULER_NAME": "cosine", "EPOCHS": epochs, "WARMUP_EPOCHS": 5, "MIN_LR": 1e-6, "WARMUP_LR": 1e-7}
+    lr_scheduler = build_scheduler(lr_args, optimizer, num_steps)
+    
     for epoch in range(epochs):
         train_dataloader.sampler.set_epoch(epoch)
         print(f">>> Training epoch {epoch}")
@@ -400,8 +405,8 @@ def train(dataset: ClipCocoDataset, model: ClipCaptionModel, args,
             loss = nnf.cross_entropy(logits.reshape(-1, logits.shape[-1]), gt.flatten(), ignore_index=-1)
             loss.backward()
             optimizer.step()
-            # scheduler.step()
             optimizer.zero_grad()
+            lr_scheduler.step_update(epoch * num_steps + idx)
             torch.cuda.synchronize()
             progress.set_postfix({"loss": loss.item(), 'lr': optimizer.param_groups[0]['lr']})
             if dist.get_rank() == 0:
@@ -410,14 +415,14 @@ def train(dataset: ClipCocoDataset, model: ClipCaptionModel, args,
             progress.update()
             if (idx + 1) % 100 == 0 and dist.get_rank() == 0:
                 torch.save(
-                    model.module.state_dict(),
+                    {'model':model.module.state_dict(), 'lr_scheduler': lr_scheduler.state_dict(), 'optimizer': optimizer.state_dict()},
                     os.path.join(output_dir, f"{output_prefix}_latest.pt"),
                 )
         progress.close()
         if epoch % args.save_every == 0 or epoch == epochs - 1:
             if dist.get_rank() == 0:
                 torch.save(
-                    model.module.state_dict(),
+                    {'model':model.module.state_dict(), 'lr_scheduler': lr_scheduler.state_dict(), 'optimizer': optimizer.state_dict()},
                     os.path.join(output_dir, f"{output_prefix}-{epoch:03d}.pt"),
                 )
     return model
