@@ -30,6 +30,7 @@ from PIL import Image
 from PIL import ImageFile
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 import numpy as np
+from lr_scheduler import build_scheduler
 
 class MappingType(Enum):
     MLP = 'mlp'
@@ -270,7 +271,7 @@ class ClipCaptionModel(nn.Module):
         # prefix_projections = self.clip_project(prefix).view(-1, self.prefix_length, self.gpt_embedding_size)
         with torch.no_grad():
             prefix = self.image_encode(prefix)
-        prefix_projections = self.clip_project(prefix.to(dtype=torch.float32))
+        prefix_projections = self.clip_project(prefix)
         if labels is not None:
             dummy_token = self.get_dummy_token(tokens.shape[0], tokens.device)
             labels = torch.cat((dummy_token, tokens), dim=1)
@@ -371,7 +372,7 @@ def get_pretrain_param_groups(model, skip_list=(), skip_keywords=()):
 
 
 def train(dataset: ClipCocoDataset, model: ClipCaptionModel, args,
-          warmup_steps: int = 5000, output_dir: str = ".", output_prefix: str = ""):
+          output_dir: str = ".", output_prefix: str = ""):
 
     local_rank = args.local_rank
     torch.cuda.set_device(local_rank)
@@ -390,6 +391,7 @@ def train(dataset: ClipCocoDataset, model: ClipCaptionModel, args,
     num_steps = len(train_dataloader)
     lr_args = {"LR_SCHEDULER_NAME": "cosine", "EPOCHS": epochs, "WARMUP_EPOCHS": 5, "MIN_LR": 1e-6, "WARMUP_LR": 1e-7}
     lr_scheduler = build_scheduler(lr_args, optimizer, num_steps)
+    scaler = amp.GradScaler()
     
     for epoch in range(epochs):
         train_dataloader.sampler.set_epoch(epoch)
@@ -401,13 +403,16 @@ def train(dataset: ClipCocoDataset, model: ClipCaptionModel, args,
             mask = mask.cuda(non_blocking=True)
             prefix = prefix.cuda(non_blocking=True)
             gt = gt.cuda(non_blocking=True)
-            outputs = model(tokens, prefix, mask)
+            with amp.autocast(enabled=args.enable_amp):
+                outputs = model(tokens, prefix, mask)
             logits = outputs.logits
             # FIXME: is this ignore_index correct? 0 is ! in vocab
             loss = nnf.cross_entropy(logits.reshape(-1, logits.shape[-1]), gt.flatten(), ignore_index=-1)
-            loss.backward()
-            optimizer.step()
+          
             optimizer.zero_grad()
+            scaler.scale(loss).backward() #loss.backward()
+            scaler.step(optimizer) #optimizer.step()
+            scaler.update()
             lr_scheduler.step_update(epoch * num_steps + idx)
             torch.cuda.synchronize()
             progress.set_postfix({"loss": loss.item(), 'lr': optimizer.param_groups[0]['lr']})
@@ -417,14 +422,14 @@ def train(dataset: ClipCocoDataset, model: ClipCaptionModel, args,
             progress.update()
             if (idx + 1) % 100 == 0 and dist.get_rank() == 0:
                 torch.save(
-                    {'model':model.module.state_dict(), 'lr_scheduler': lr_scheduler.state_dict(), 'optimizer': optimizer.state_dict()},
+                    {'model':model.module.state_dict(), 'lr_scheduler': lr_scheduler.state_dict(), 'optimizer': optimizer.state_dict(), 'scaler': scaler.state_dict()},
                     os.path.join(output_dir, f"{output_prefix}_latest.pt"),
                 )
         progress.close()
         if epoch % args.save_every == 0 or epoch == epochs - 1:
             if dist.get_rank() == 0:
                 torch.save(
-                    {'model':model.module.state_dict(), 'lr_scheduler': lr_scheduler.state_dict(), 'optimizer': optimizer.state_dict()},
+                    {'model':model.module.state_dict(), 'lr_scheduler': lr_scheduler.state_dict(), 'optimizer': optimizer.state_dict(), 'scaler': scaler.state_dict()},
                     os.path.join(output_dir, f"{output_prefix}-{epoch:03d}.pt"),
                 )
     return model
@@ -449,6 +454,10 @@ def parse_args():
                         help='tag of job, used for wandb and output')
     parser.add_argument('--is_rn', dest='is_rn', action='store_true')
     parser.add_argument('--normalize_prefix', dest='normalize_prefix', action='store_true')
+    parser.add_argument('--enable-amp', action='store_true')
+    parser.add_argument('--disable-amp', action='store_false', dest='enable_amp')
+    parser.set_defaults(enable_amp=True)
+
     parser.add_argument("--local_rank", type=int, required=True, help='local rank for DistributedDataParallel')
     args = parser.parse_args()
     args.out_dir = os.path.join(args.out_dir, args.tag)
