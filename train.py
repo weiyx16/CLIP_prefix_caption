@@ -383,7 +383,7 @@ def train(dataset: ClipCocoDataset, model: ClipCaptionModel, args,
     parameters = get_pretrain_param_groups(model)
     optimizer = AdamW(parameters, lr=args.lr, weight_decay=args.wd)
     train_sampler = torch.utils.data.distributed.DistributedSampler(dataset)
-    train_dataloader = DataLoader(dataset, batch_size=batch_size, sampler=train_sampler)
+    train_dataloader = DataLoader(dataset, batch_size=batch_size, sampler=train_sampler, num_workers=8, pin_memory=True, drop_last=True)
     for epoch in range(epochs):
         train_dataloader.sampler.set_epoch(epoch)
         print(f">>> Training epoch {epoch}")
@@ -423,13 +423,10 @@ def train(dataset: ClipCocoDataset, model: ClipCaptionModel, args,
     return model
 
 
-def main(local_rank, world_size):
-    dist.init_process_group("nccl", rank=local_rank, world_size=world_size)
-    torch.distributed.barrier()
-    setup_for_distributed(local_rank == 0) ##### HERE
+def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--data', default='./data/coco/oscar_split_train.pkl')
-    parser.add_argument('--data_root', help='raw coco training image path')
+    parser.add_argument('--data_root', default='./data/MSCOCO_CAPTION', help='raw coco training image path')
     parser.add_argument('--out_dir', default='./checkpoints')
     parser.add_argument('--epochs', type=int, default=30)
     parser.add_argument('--save_every', type=int, default=5)
@@ -445,12 +442,15 @@ def main(local_rank, world_size):
                         help='tag of job, used for wandb and output')
     parser.add_argument('--is_rn', dest='is_rn', action='store_true')
     parser.add_argument('--normalize_prefix', dest='normalize_prefix', action='store_true')
-    parser.add_argument("--local_rank", default=-1)
+    parser.add_argument("--local_rank", type=int, required=True, help='local rank for DistributedDataParallel')
     args = parser.parse_args()
-    args.local_rank = local_rank
     args.out_dir = os.path.join(args.out_dir, args.tag)
     os.makedirs(args.out_dir, exist_ok=True)
     save_config(args)
+    return args
+
+
+def main(args):
     if dist.get_rank() == 0:
         wandb.login(key='49222ad51163763788e59460ea91552f32605e38')
         run = wandb.init(
@@ -461,16 +461,15 @@ def main(local_rank, world_size):
             job_type='train_model',
             config=args,
         )
-    prefix_length = args.prefix_length
     dataset = ClipCocoDataset(args.data_root, args.data, normalize_prefix=args.normalize_prefix)
     prefix_dim = 640 if args.is_rn else 512
     args.mapping_type = {'mlp': MappingType.MLP, 'transformer': MappingType.Transformer}[args.mapping_type]
     if args.only_prefix:
-        model = ClipCaptionPrefix(prefix_length, clip_length=args.prefix_length_clip, prefix_size=prefix_dim,
+        model = ClipCaptionPrefix(args.prefix_length, clip_length=args.prefix_length_clip, prefix_size=prefix_dim,
                                   num_layers=args.num_layers, mapping_type=args.mapping_type)
         print("Train only prefix")
     else:
-        model = ClipCaptionModel(prefix_length, clip_length=args.prefix_length_clip, prefix_size=prefix_dim,
+        model = ClipCaptionModel(args.prefix_length, clip_length=args.prefix_length_clip, prefix_size=prefix_dim,
                                   num_layers=args.num_layers, mapping_type=args.mapping_type)
         print("Train both prefix and GPT")
         sys.stdout.flush()
@@ -480,9 +479,22 @@ def main(local_rank, world_size):
 
 
 if __name__ == '__main__':
-    world_size = 8
-    mp.spawn(main,
-        args=(world_size,),
-        nprocs=world_size,
-        join=True)
+    # command:  python -m torch.distributed.launch --nproc_per_node 4 train.py --data ./oscar_split_ViT-B_32_train_512.pkl --out_dir ./output --bs 32
+    args = parse_args()
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+        rank = int(os.environ["RANK"])
+        world_size = int(os.environ['WORLD_SIZE'])
+        print(f"RANK and WORLD_SIZE in environ: {rank}/{world_size}")
+    else:
+        rank = -1
+        world_size = -1
+    dist.init_process_group("nccl", init_method='env://', rank=args.local_rank, world_size=world_size)
+    torch.distributed.barrier()
+    setup_for_distributed(args.local_rank == 0) ##### HERE
 
+    seed = dist.get_rank()
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    cudnn.benchmark = True
+
+    main(args)
