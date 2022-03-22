@@ -266,8 +266,10 @@ def generate2(
                                                     ].clone()
                 sorted_indices_to_remove[..., 0] = 0 # incase of one word with > top_p prob
 
-                indices_to_remove = sorted_indices[sorted_indices_to_remove]
-                logits[:, indices_to_remove] = filter_value
+                # indices_to_remove = sorted_indices[sorted_indices_to_remove]
+                # logits[:, indices_to_remove] = filter_value
+                for ele in range(logits.size(0)):
+                    logits[ele, sorted_indices[ele, sorted_indices_to_remove[ele]]] = filter_value
                 next_token = torch.argmax(logits, -1)
                 next_token_embed = model.module.gpt.transformer.wte(next_token).unsqueeze(1) # bs, 1, dim
                 next_token = next_token.unsqueeze(1) # bs, 1
