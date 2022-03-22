@@ -239,7 +239,7 @@ def generate2(
         entry_length=67,  # maximum number of words
         top_p=0.8,
         temperature=1.,
-        stop_token: str = '.',
+        stop_token: str = '<|endoftext|>',
 ):
     # embed: image feature, we only need to inference once
     model.eval()
@@ -264,7 +264,7 @@ def generate2(
                 sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[
                                                     ..., :-1
                                                     ].clone()
-                sorted_indices_to_remove[..., 0] = 0
+                sorted_indices_to_remove[..., 0] = 0 # incase of one word with > top_p prob
 
                 indices_to_remove = sorted_indices[sorted_indices_to_remove]
                 logits[:, indices_to_remove] = filter_value

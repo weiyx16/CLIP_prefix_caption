@@ -419,7 +419,7 @@ def val(model, epoch, val_dataloader, args):
     progress.close()
     os.makedirs('.cache', exist_ok=True)
     json.dump(result_all, open(f".cache/tmp-results-{dist.get_rank()}.json", "w"))
-    torch.cuda.synchronize()
+    torch.distributed.barrier()
     if dist.get_rank() == 0:
         result_all = []
         for i in range(dist.get_world_size()):
@@ -428,7 +428,7 @@ def val(model, epoch, val_dataloader, args):
         result = evaluate_on_coco_caption(result_all, os.path.join(args.out_dir, f"{args.tag}-{epoch:03d}-results.json"), os.path.join(args.data_root, 'annotations/captions_val2014.json'))
     else:
         result = None
-    torch.cuda.synchronize()
+    torch.distributed.barrier()
     if dist.get_rank() == 0:
         wandb.log({'BLEU_4': result['Bleu_4'], 'METEOR': result['METEOR'], 'ROUGE_L': result['ROUGE_L'], 'CIDEr': result['CIDEr'], 'SPICE': result['SPICE']})
     return result
