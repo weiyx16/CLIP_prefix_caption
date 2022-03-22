@@ -454,18 +454,7 @@ def train(model, epoch, train_dataloader, optimizer, lr_scheduler, scaler, args,
             wandb.log({'train_loss': loss.item(),
                        'lr': optimizer.param_groups[0]['lr']})
         progress.update()
-        if (idx + 1) % 100 == 0 and dist.get_rank() == 0:
-            torch.save(
-                {'model':model.module.state_dict(), 'lr_scheduler': lr_scheduler.state_dict(), 'optimizer': optimizer.state_dict(), 'scaler': scaler.state_dict()},
-                os.path.join(output_dir, f"{output_prefix}_latest.pt"),
-            )
     progress.close()
-    if epoch % args.save_every == 0 or epoch == args.epochs - 1:
-        if dist.get_rank() == 0:
-            torch.save(
-                {'model':model.module.state_dict(), 'lr_scheduler': lr_scheduler.state_dict(), 'optimizer': optimizer.state_dict(), 'scaler': scaler.state_dict()},
-                os.path.join(output_dir, f"{output_prefix}-{epoch:03d}.pt"),
-            )
     return model
 
 
@@ -480,7 +469,7 @@ def parse_args():
     parser.add_argument('--prefix_length_clip', type=int, default=10)
     parser.add_argument('--bs', type=int, default=128)
     parser.add_argument('--lr', type=float, default=1e-4)
-    parser.add_argument('--wd', type=int, default=0.01)
+    parser.add_argument('--wd', type=float, default=0.01)
     parser.add_argument('--only_prefix', dest='only_prefix', action='store_true')
     parser.add_argument('--mapping_type', type=str, default='mlp', help='mlp/transformer')
     parser.add_argument('--num_layers', type=int, default=8)
@@ -546,11 +535,23 @@ def main(args):
     lr_args = {"LR_SCHEDULER_NAME": "cosine", "EPOCHS": args.epochs, "WARMUP_EPOCHS": 5, "MIN_LR": 1e-6, "WARMUP_LR": 1e-7}
     lr_scheduler = build_scheduler(lr_args, optimizer, len(train_dataloader))
     
+    best_cider = 0
     for epoch in range(args.epochs):
         _ = train(model, epoch, train_dataloader, optimizer, lr_scheduler, scaler, args, output_dir=args.out_dir, output_prefix=args.tag)
-        _ = val(model, epoch, val_dataloader, args)
-        
-
+        result = val(model, epoch, val_dataloader, args)
+        if epoch % args.save_every == 0 or epoch == args.epochs - 1:
+            if dist.get_rank() == 0:
+                torch.save(
+                    {'model':model.module.state_dict(), 'lr_scheduler': lr_scheduler.state_dict(), 'optimizer': optimizer.state_dict(), 'scaler': scaler.state_dict()},
+                    os.path.join(args.out_dir, f"{args.tag}-{epoch:03d}.pt"),
+                )
+        if result['CIDEr'] > best_cider:
+            best_cider = result['CIDEr']
+            if dist.get_rank() == 0:
+                torch.save(
+                    {'model':model.module.state_dict()},
+                    os.path.join(args.out_dir, f"{args.tag}-best.pt"),
+                )
 
 if __name__ == '__main__':
     # command:  python -m torch.distributed.launch --nproc_per_node 4 train.py --data ./oscar_split_ViT-B_32_train_512.pkl --out_dir ./output --bs 32
