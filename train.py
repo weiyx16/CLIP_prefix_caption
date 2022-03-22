@@ -417,8 +417,15 @@ def val(model, epoch, val_dataloader, args):
         r = [{'image_id': _image_path, 'result': _text} for _image_path, _text in zip(image_path, generated_text_prefix)]
         result_all.extend(r)
     progress.close()
-    json.dump(result_all, open(os.path.join(args.out_dir, f"{args.tag}-{epoch:03d}-results.json"), "w"))
-    result = evaluate_on_coco_caption(result_all, os.path.join(args.out_dir, f"{args.tag}-{epoch:03d}-results.json"), os.path.join(args.data_root, 'annotations/captions_val2014.json'))
+    json.dump(result_all, open(f".cache/tmp-results-{dist.get_rank()}.json", "w"))
+    torch.cuda.synchronize()
+    if dist.get_rank() == 0:
+        result_all = []
+        for i in range(dist.get_world_size()):
+            part_result = json.load(open(f".cache/tmp-results-{i}.json"))
+            result_all.extend(part_result)
+        result = evaluate_on_coco_caption(result_all, os.path.join(args.out_dir, f"{args.tag}-{epoch:03d}-results.json"), os.path.join(args.data_root, 'annotations/captions_val2014.json'))
+    torch.cuda.synchronize()
     if dist.get_rank() == 0:
         wandb.log({'BLEU_4': result['Bleu_4'], 'METEOR': result['METEOR'], 'ROUGE_L': result['ROUGE_L'], 'CIDEr': result['CIDEr'], 'SPICE': result['SPICE']})
     return result
