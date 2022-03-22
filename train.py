@@ -417,6 +417,7 @@ def val(model, epoch, val_dataloader, args):
         r = [{'image_id': _image_path, 'result': _text} for _image_path, _text in zip(image_path, generated_text_prefix)]
         result_all.extend(r)
     progress.close()
+    os.makedirs('.cache', exist_ok=True)
     json.dump(result_all, open(f".cache/tmp-results-{dist.get_rank()}.json", "w"))
     torch.cuda.synchronize()
     if dist.get_rank() == 0:
@@ -425,6 +426,8 @@ def val(model, epoch, val_dataloader, args):
             part_result = json.load(open(f".cache/tmp-results-{i}.json"))
             result_all.extend(part_result)
         result = evaluate_on_coco_caption(result_all, os.path.join(args.out_dir, f"{args.tag}-{epoch:03d}-results.json"), os.path.join(args.data_root, 'annotations/captions_val2014.json'))
+    else:
+        result = None
     torch.cuda.synchronize()
     if dist.get_rank() == 0:
         wandb.log({'BLEU_4': result['Bleu_4'], 'METEOR': result['METEOR'], 'ROUGE_L': result['ROUGE_L'], 'CIDEr': result['CIDEr'], 'SPICE': result['SPICE']})
@@ -553,13 +556,12 @@ def main(args):
                     {'model':model.module.state_dict(), 'lr_scheduler': lr_scheduler.state_dict(), 'optimizer': optimizer.state_dict(), 'scaler': scaler.state_dict()},
                     os.path.join(args.out_dir, f"{args.tag}-{epoch:03d}.pt"),
                 )
-        if result['CIDEr'] > best_cider:
+        if dist.get_rank() == 0 and result['CIDEr'] > best_cider:
             best_cider = result['CIDEr']
-            if dist.get_rank() == 0:
-                torch.save(
-                    {'model':model.module.state_dict()},
-                    os.path.join(args.out_dir, f"{args.tag}-best.pt"),
-                )
+            torch.save(
+                {'model':model.module.state_dict()},
+                os.path.join(args.out_dir, f"{args.tag}-best.pt"),
+            )
 
 if __name__ == '__main__':
     # command:  python -m torch.distributed.launch --nproc_per_node 4 train.py --data ./oscar_split_ViT-B_32_train_512.pkl --out_dir ./output --bs 32
