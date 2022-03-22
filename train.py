@@ -417,7 +417,7 @@ def val(model, epoch, val_dataloader, args):
         result_all.extend(r)
     progress.close()
     json.dump(result_all, open(os.path.join(args.out_dir, f"{args.tag}-{epoch:03d}-results.json"), "w"))
-    result = evaluate_on_coco_caption(os.path.join(args.out_dir, f"{args.tag}-{epoch:03d}-results.json"), os.path.join(args.data_root, 'annotations/captions_val2014.json'))
+    result = evaluate_on_coco_caption(result_all, os.path.join(args.out_dir, f"{args.tag}-{epoch:03d}-results.json"), os.path.join(args.data_root, 'annotations/captions_val2014.json'))
     if dist.get_rank() == 0:
         wandb.log({'BLEU_4': result['Bleu_4'], 'METEOR': result['METEOR'], 'ROUGE_L': result['ROUGE_L'], 'CIDEr': result['CIDEr'], 'SPICE': result['SPICE']})
     return result

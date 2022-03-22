@@ -347,17 +347,16 @@ def evaluate_on_nocaps(split, predict_file, data_dir='data/nocaps/', evaluate_fi
     return metrics
 
 
-def evaluate_on_coco_caption(res_file, label_file, outfile=None):
+def evaluate_on_coco_caption(results, res_file, label_file, outfile=None):
     """
         # ref to fake example: https://github.com/LuoweiZhou/coco-caption/tree/de6f385503ac9a4305a1dcdc39c02312f9fa13fc
     """
     assert label_file.endswith('.json')
-    results = json.load(open(res_file))
     parsed_res = []
     for result in results:
         id = int(result['image_id'].split('.')[0].split('_')[2])
         # cap = result['result'].replace('<|startoftext|>', '').replace('<|endoftext|>', '').replace('!', '').replace(' .', '.').strip() #result["ground truth"][0]
-        cap = result['result'].split('<|endoftext|>')[0].strip()
+        cap = str(result['result'].split('<|endoftext|>')[0].strip())
         parsed_res.append({"image_id": id, "caption": cap})
     json.dump(parsed_res, open(res_file, 'w'))
 
