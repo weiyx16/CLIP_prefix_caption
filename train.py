@@ -342,8 +342,9 @@ def save_config(args: argparse.Namespace):
     for key, item in args._get_kwargs():
         config[key] = item
     out_path = os.path.join(args.out_dir, f"{args.tag}-args.json")
-    with open(out_path, 'w') as outfile:
-        json.dump(config, outfile)
+    if args.local_rank == 0:
+        with open(out_path, 'w') as outfile:
+            json.dump(config, outfile)
 
 
 def load_model(model, args, epoch_or_latest: Union[str, int] = '_latest'):
