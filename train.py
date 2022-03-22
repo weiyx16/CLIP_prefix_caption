@@ -1,6 +1,4 @@
 import os
-os.environ['MASTER_ADDR'] = 'localhost'
-os.environ['MASTER_PORT'] = '12355'
 import torch
 import torch.nn as nn
 import torch.backends.cudnn as cudnn
@@ -31,6 +29,7 @@ from PIL import ImageFile
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 import numpy as np
 from lr_scheduler import build_scheduler
+from misc import generate2, generate_beam, evaluate_on_coco_caption
 
 class MappingType(Enum):
     MLP = 'mlp'
@@ -73,8 +72,13 @@ class ClipCocoDataset(Dataset):
     def __getitem__(self, item: int) -> Tuple[torch.Tensor, ...]:
         tokens, mask, gt = self.pad_tokens(item)
         img_id = self.image_ids[item]
+        # train+restval
         filename = f"{self.data_root}/train2014/COCO_train2014_{int(img_id):012d}.jpg"
-        image = io1.imread(filename)
+        try:
+            image = io1.imread(filename)
+        except:
+            filename = f"{self.data_root}/val2014/COCO_val2014_{int(img_id):012d}.jpg"
+            image = io1.imread(filename)
         image = Image.fromarray(image)
         image = self.preprocess(image)
         ## this is for pre-computed clip feature
@@ -114,6 +118,26 @@ class ClipCocoDataset(Dataset):
         all_len = torch.tensor([len(self.captions_tokens[i]) for i in range(len(self))]).float()
         ## notice current one is 40
         self.max_seq_len = min(int(all_len.mean() + all_len.std() * 10), int(all_len.max()))
+
+
+class ClipCocoValDataset(Dataset):
+
+    def __len__(self) -> int:
+        return len(self.files)
+
+    def __getitem__(self, item: int):
+        _filename = self.files[item]
+        filename = f"{self.data_root}/val2014/{_filename}"
+        image = io1.imread(filename)
+        image = Image.fromarray(image)
+        image = self.preprocess(image)
+        return image, _filename
+
+    def __init__(self, data_root: str):
+        self.data_root = data_root
+        with open('captioneval/coco_val.txt') as f:
+            self.files = f.read().splitlines()
+        self.preprocess = _transform(224)
 
 
 class MLP(nn.Module):
@@ -317,30 +341,26 @@ def save_config(args: argparse.Namespace):
     config = {}
     for key, item in args._get_kwargs():
         config[key] = item
-    out_path = os.path.join(args.out_dir, f"{args.tag}.json")
+    out_path = os.path.join(args.out_dir, f"{args.tag}-args.json")
     with open(out_path, 'w') as outfile:
         json.dump(config, outfile)
 
 
-def load_model(config_path: str, epoch_or_latest: Union[str, int] = '_latest'):
-    with open(config_path) as f:
-        config = json.load(f)
-    parser = argparse.ArgumentParser()
-    parser.set_defaults(**config)
-    args = parser.parse_args()
+def load_model(model, args, epoch_or_latest: Union[str, int] = '_latest'):
+    # with open(config_path) as f:
+    #     config = json.load(f)
+    # parser = argparse.ArgumentParser()
+    # parser.set_defaults(**config)
+    # args = parser.parse_args()
     if type(epoch_or_latest) is int:
         epoch_or_latest = f"-{epoch_or_latest:03d}"
     model_path = os.path.join(args.out_dir, f"{args.tag}{epoch_or_latest}.pt")
-    if args.only_prefix:
-        model = ClipCaptionPrefix(args.prefix_length)
-    else:
-        model = ClipCaptionModel(args.prefix_length)
     if os.path.isfile(model_path):
         print(f"loading model from {model_path}")
         model.load_state_dict(torch.load(model_path, map_location=torch.device('cpu'))["model"])
     else:
         print(f"{model_path} is not exist")
-    return model, parser
+    return model
 
 def check_keywords_in_name(name, keywords=()):
     isin = False
@@ -371,67 +391,81 @@ def get_pretrain_param_groups(model, skip_list=(), skip_keywords=()):
             {'params': no_decay, 'weight_decay': 0.}]
 
 
-def train(dataset: ClipCocoDataset, model: ClipCaptionModel, args,
-          output_dir: str = ".", output_prefix: str = ""):
+@torch.no_grad()
+def val(model, epoch, val_dataloader, args):
+    model.eval()
+    tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+    print(f">>> Evaling epoch {epoch}")
+    sys.stdout.flush()
+    progress = tqdm(total=len(val_dataloader), desc=args.tag)
+    result_all = []
+    for idx, (image, image_path) in enumerate(val_dataloader):
+        image = image.cuda(non_blocking=True)
+        
+        prefix = model.module.image_encode(image)
+        prefix_embed = model.module.clip_project(prefix)
+        if args.use_beam_search:
+            assert False, "Not check beam search for now"
+            generated_text_prefix = generate_beam(model, tokenizer, embed=prefix_embed)[0]
+        else:
+            generated_text_prefix = generate2(model, tokenizer, embed=prefix_embed)
 
-    local_rank = args.local_rank
-    torch.cuda.set_device(local_rank)
-    batch_size = args.bs
-    epochs = args.epochs
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
-    model = model.cuda()
-    model = DDP(model, device_ids=[local_rank], broadcast_buffers=False)
+        torch.cuda.synchronize()
+        progress.update()
+
+        r = [{'image_id': _image_path, 'result': _text} for _image_path, _text in zip(image_path, generated_text_prefix)]
+        result_all.extend(r)
+    progress.close()
+    json.dump(result_all, open(os.path.join(args.out_dir, f"{args.tag}-{epoch:03d}-results.json"), "w"))
+    result = evaluate_on_coco_caption(os.path.join(args.out_dir, f"{args.tag}-{epoch:03d}-results.json"), os.path.join(args.data_root, 'annotations/captions_val2014.json'))
+    if dist.get_rank() == 0:
+        wandb.log({'BLEU_4': result['Bleu_4'], 'METEOR': result['METEOR'], 'ROUGE_L': result['ROUGE_L'], 'CIDEr': result['CIDEr'], 'SPICE': result['SPICE']})
+    return result
+
+
+def train(model, epoch, train_dataloader, optimizer, lr_scheduler, scaler, args,
+          output_dir: str = ".", output_prefix: str = ""):
     model.train()
-    parameters = get_pretrain_param_groups(model)
-    optimizer = AdamW(parameters, lr=args.lr, weight_decay=args.wd)
-    train_sampler = torch.utils.data.distributed.DistributedSampler(dataset)
-    train_dataloader = DataLoader(dataset, batch_size=batch_size, sampler=train_sampler, num_workers=8, pin_memory=True, drop_last=True)
-    
     num_steps = len(train_dataloader)
-    lr_args = {"LR_SCHEDULER_NAME": "cosine", "EPOCHS": epochs, "WARMUP_EPOCHS": 5, "MIN_LR": 1e-6, "WARMUP_LR": 1e-7}
-    lr_scheduler = build_scheduler(lr_args, optimizer, num_steps)
-    scaler = amp.GradScaler()
-    
-    for epoch in range(epochs):
-        train_dataloader.sampler.set_epoch(epoch)
-        print(f">>> Training epoch {epoch}")
-        sys.stdout.flush()
-        progress = tqdm(total=len(train_dataloader), desc=output_prefix)
-        for idx, (tokens, mask, prefix, gt) in enumerate(train_dataloader):
-            tokens = tokens.cuda(non_blocking=True)
-            mask = mask.cuda(non_blocking=True)
-            prefix = prefix.cuda(non_blocking=True)
-            gt = gt.cuda(non_blocking=True)
-            with amp.autocast(enabled=args.enable_amp):
-                outputs = model(tokens, prefix, mask)
-            logits = outputs.logits
-            # FIXME: is this ignore_index correct? 0 is ! in vocab
-            loss = nnf.cross_entropy(logits.reshape(-1, logits.shape[-1]), gt.flatten(), ignore_index=-1)
-          
-            optimizer.zero_grad()
-            scaler.scale(loss).backward() #loss.backward()
-            scaler.step(optimizer) #optimizer.step()
-            scaler.update()
-            lr_scheduler.step_update(epoch * num_steps + idx)
-            torch.cuda.synchronize()
-            progress.set_postfix({"loss": loss.item(), 'lr': optimizer.param_groups[0]['lr']})
-            if dist.get_rank() == 0:
-                wandb.log({'train_loss': loss.item(),
-                           'lr': optimizer.param_groups[0]['lr']})
-            progress.update()
-            if (idx + 1) % 100 == 0 and dist.get_rank() == 0:
-                torch.save(
-                    {'model':model.module.state_dict(), 'lr_scheduler': lr_scheduler.state_dict(), 'optimizer': optimizer.state_dict(), 'scaler': scaler.state_dict()},
-                    os.path.join(output_dir, f"{output_prefix}_latest.pt"),
-                )
-        progress.close()
-        if epoch % args.save_every == 0 or epoch == epochs - 1:
-            if dist.get_rank() == 0:
-                torch.save(
-                    {'model':model.module.state_dict(), 'lr_scheduler': lr_scheduler.state_dict(), 'optimizer': optimizer.state_dict(), 'scaler': scaler.state_dict()},
-                    os.path.join(output_dir, f"{output_prefix}-{epoch:03d}.pt"),
-                )
+
+    train_dataloader.sampler.set_epoch(epoch)
+    print(f">>> Training epoch {epoch}")
+    sys.stdout.flush()
+    progress = tqdm(total=len(train_dataloader), desc=output_prefix)
+    for idx, (tokens, mask, prefix, gt) in enumerate(train_dataloader):
+        # prefix is raw images
+        tokens = tokens.cuda(non_blocking=True)
+        mask = mask.cuda(non_blocking=True)
+        prefix = prefix.cuda(non_blocking=True)
+        gt = gt.cuda(non_blocking=True)
+        with amp.autocast(enabled=args.enable_amp):
+            outputs = model(tokens, prefix, mask)
+        logits = outputs.logits
+        loss = nnf.cross_entropy(logits.reshape(-1, logits.shape[-1]), gt.flatten(), ignore_index=-1)
+        
+        optimizer.zero_grad()
+        scaler.scale(loss).backward() #loss.backward()
+        scaler.step(optimizer) #optimizer.step()
+        scaler.update()
+        lr_scheduler.step_update(epoch * num_steps + idx)
+        torch.cuda.synchronize()
+        progress.set_postfix({"loss": loss.item(), 'lr': optimizer.param_groups[0]['lr']})
+        if dist.get_rank() == 0:
+            wandb.log({'train_loss': loss.item(),
+                       'lr': optimizer.param_groups[0]['lr']})
+        progress.update()
+        if (idx + 1) % 100 == 0 and dist.get_rank() == 0:
+            torch.save(
+                {'model':model.module.state_dict(), 'lr_scheduler': lr_scheduler.state_dict(), 'optimizer': optimizer.state_dict(), 'scaler': scaler.state_dict()},
+                os.path.join(output_dir, f"{output_prefix}_latest.pt"),
+            )
+    progress.close()
+    if epoch % args.save_every == 0 or epoch == args.epochs - 1:
+        if dist.get_rank() == 0:
+            torch.save(
+                {'model':model.module.state_dict(), 'lr_scheduler': lr_scheduler.state_dict(), 'optimizer': optimizer.state_dict(), 'scaler': scaler.state_dict()},
+                os.path.join(output_dir, f"{output_prefix}-{epoch:03d}.pt"),
+            )
     return model
 
 
@@ -454,6 +488,7 @@ def parse_args():
                         help='tag of job, used for wandb and output')
     parser.add_argument('--is_rn', dest='is_rn', action='store_true')
     parser.add_argument('--normalize_prefix', dest='normalize_prefix', action='store_true')
+    parser.add_argument('--use_beam_search', action='store_true')
     parser.add_argument('--enable-amp', action='store_true')
     parser.add_argument('--disable-amp', action='store_false', dest='enable_amp')
     parser.set_defaults(enable_amp=True)
@@ -477,7 +512,6 @@ def main(args):
             job_type='train_model',
             config=args,
         )
-    dataset = ClipCocoDataset(args.data_root, args.data, normalize_prefix=args.normalize_prefix)
     prefix_dim = 640 if args.is_rn else 512
     args.mapping_type = {'mlp': MappingType.MLP, 'transformer': MappingType.Transformer}[args.mapping_type]
     if args.only_prefix:
@@ -491,7 +525,31 @@ def main(args):
         sys.stdout.flush()
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f'{total_params:,} total parameters')
-    train(dataset, model, args, output_dir=args.out_dir, output_prefix=args.tag)
+
+    local_rank = args.local_rank
+    torch.cuda.set_device(local_rank)
+    model = model.cuda()
+    
+    parameters = get_pretrain_param_groups(model)
+    optimizer = AdamW(parameters, lr=args.lr, weight_decay=args.wd)
+    scaler = amp.GradScaler()
+    model = DDP(model, device_ids=[local_rank], broadcast_buffers=False)
+
+    dataset = ClipCocoDataset(args.data_root, args.data, normalize_prefix=args.normalize_prefix)
+    train_sampler = torch.utils.data.distributed.DistributedSampler(dataset)
+    train_dataloader = DataLoader(dataset, batch_size=args.bs, sampler=train_sampler, num_workers=8, pin_memory=True, drop_last=True)
+
+    val_dataset = ClipCocoValDataset(args.data_root)
+    val_sampler = torch.utils.data.distributed.DistributedSampler(val_dataset, shuffle=False)
+    val_dataloader = DataLoader(val_dataset, batch_size=args.bs, sampler=val_sampler, num_workers=8, pin_memory=True, drop_last=False)
+    
+    lr_args = {"LR_SCHEDULER_NAME": "cosine", "EPOCHS": args.epochs, "WARMUP_EPOCHS": 5, "MIN_LR": 1e-6, "WARMUP_LR": 1e-7}
+    lr_scheduler = build_scheduler(lr_args, optimizer, len(train_dataloader))
+    
+    for epoch in range(args.epochs):
+        _ = train(model, epoch, train_dataloader, optimizer, lr_scheduler, scaler, args, output_dir=args.out_dir, output_prefix=args.tag)
+        _ = val(model, epoch, val_dataloader, args)
+        
 
 
 if __name__ == '__main__':
