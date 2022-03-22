@@ -503,13 +503,13 @@ def parse_args():
 
 def main(args):
     if dist.get_rank() == 0:
-        wandb.login(key='49222ad51163763788e59460ea91552f32605e38')
+        wandb.login(key='c26712d8885e3e6742ffd9c311e10870a46a197f')
         run = wandb.init(
             id=args.tag,
             name=args.tag,
-            entity='buxiangzhiren',
-            project='baseline',
-            job_type='train_model',
+            entity='msravcg',
+            project='diffuseIC',
+            job_type='coco',
             config=args,
         )
     prefix_dim = 640 if args.is_rn else 512
