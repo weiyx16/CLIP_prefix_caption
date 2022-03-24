@@ -61,9 +61,9 @@ class ClipCocoDataset(Dataset):
         padding = self.max_seq_len - tokens.shape[0]
         evert_t = sample_time(1, tokens.shape[0], tokens.device)
         # evert_t is 0 to length-1, generate input; 0 means mask 1 to mask 0; length-1 means mask full to mask (l-1)
-        maskids = torch.randperm(tokens.shape[0])[:evert_t+1]
-        tokens[maskids] = 50257 # 50257 will be replaced with a standalone mask token
-        maskids = maskids[-1] # The left one as gt; as previous, we only need this
+        _maskids = torch.randperm(tokens.shape[0])[:evert_t+1]
+        tokens[_maskids] = 50257 # 50257 will be replaced with a standalone mask token
+        maskids = _maskids[-1] # The left one as gt; as previous, we only need this
         gt = torch.full_like(_gt, -1)
         gt[maskids] = _gt[maskids]
 
@@ -75,6 +75,7 @@ class ClipCocoDataset(Dataset):
             gt = gt[:self.max_seq_len]
         mask = tokens.ge(0) # mask is zero where we out of sequence
         tokens[~mask] = 0
+        mask[_maskids[:-1]] = 0
         mask = mask.float()
         return tokens, mask, gt
 
