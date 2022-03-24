@@ -251,14 +251,16 @@ def generate2(
 
     with torch.no_grad():
         for entry_idx in range(entry_count):
-            generated = model.module.bos_embedding.unsqueeze(0).unsqueeze(0).repeat_interleave(repeats=embed.size(0), dim=0) # bs, 1, dim
+            mask_feat = model.module.bos_embedding.unsqueeze(0).unsqueeze(0).repeat_interleave(repeats=embed.size(0), dim=0) # bs, 1, dim
+            generated = mask_feat
+            tokens_feat = None
             # generated = generated.repeat_interleave(repeats=entry_length, dim=1)
             stop_signal = torch.zeros(embed.size(0)).to(torch.bool).to(device)
             for i in range(entry_length):
                 outputs = model.module.gpt(inputs_embeds=generated, encoder_hidden_states=embed)
                 logits = outputs.logits
                 # we only need the last (newest) token, so using -1 will be ok.
-                logits = logits[:, i, :] / (temperature if temperature > 0 else 1.0) # bs, vocab
+                logits = logits[:, -1, :] / (temperature if temperature > 0 else 1.0) # bs, vocab
                 sorted_logits, sorted_indices = torch.sort(logits, descending=True)
                 cumulative_probs = torch.cumsum(nnf.softmax(sorted_logits, dim=-1), dim=-1)
                 sorted_indices_to_remove = cumulative_probs > top_p
@@ -280,7 +282,10 @@ def generate2(
                     tokens = torch.cat((tokens, next_token), dim=1)
                 # for eachbatch in range(embed.size(0)):
                 #     generated[eachbatch, i, :] = next_token_embed[eachbatch, :, :]
-                generated = torch.cat((generated, next_token_embed), dim=1)
+                if tokens_feat is None:
+                    tokens_feat = torch.cat((next_token_embed, mask_feat), dim=1)
+                else:
+                    tokens_feat = torch.cat((tokens_feat[:, :-1, :], next_token_embed, mask_feat), dim=1)
                 # stop in parallel one...
                 # one case: if all sentences appear eos, then we stop
                 stop_signal = stop_signal | (stop_token_index == next_token).squeeze()

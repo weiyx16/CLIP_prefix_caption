@@ -466,7 +466,7 @@ def train(model, epoch, train_dataloader, optimizer, lr_scheduler, scaler, args,
         mask_tokens = torch.full_like(tokens, 50257)
         gt_mask_tokens = torch.full_like(gt, -1)
         for idx in range(b):
-            evert_t = sample_time(b, t_max[idx].to(torch.int), device)
+            evert_t = sample_time(1, t_max[idx].to(torch.int), device)
             if evert_t != 0:
                 mask_tokens[idx, 0:evert_t] = tokens[idx, 0:evert_t]
             mask[idx, evert_t+1:] = 0
