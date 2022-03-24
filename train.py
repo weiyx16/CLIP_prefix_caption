@@ -55,7 +55,8 @@ class ClipCocoDataset(Dataset):
 
     def pad_tokens(self, item: int):
         # notice the endoftext in tokens is just used as placehold, will be replaced by a learnable bos embedding
-        tokens = torch.cat((torch.tensor(self.tokenizer.encode('<|endoftext|>')), self.captions_tokens[item]), dim=0)
+        # tokens = torch.cat((torch.tensor(self.tokenizer.encode('<|endoftext|>')), self.captions_tokens[item]), dim=0)
+        tokens = torch.cat((self.captions_tokens[item], torch.tensor(self.tokenizer.encode('<|endoftext|>'))), dim=0)
         gt = torch.cat((self.captions_tokens[item], torch.tensor(self.tokenizer.encode('<|endoftext|>'))), dim=0)
         padding = self.max_seq_len - tokens.shape[0]
         if padding > 0:
@@ -285,13 +286,19 @@ class ClipCaptionModel(nn.Module):
     def get_dummy_token(self, batch_size: int, device: torch.device) -> torch.Tensor:
         return torch.zeros(batch_size, self.prefix_length, dtype=torch.int64, device=device)
 
-    def forward(self, tokens: torch.Tensor, prefix: torch.Tensor, mask: Optional[torch.Tensor] = None,
+    def forward(self, tokens: torch.Tensor, mask_tokens: torch.Tensor, prefix: torch.Tensor, mask: Optional[torch.Tensor] = None,
                 labels: Optional[torch.Tensor] = None):
         self.clip_model.eval()
         embedding_text = self.gpt.transformer.wte(tokens)
         batch_size = embedding_text.size()[0]
+        seq_len = embedding_text.size()[1]
         bos_token_embedding = self.bos_embedding.unsqueeze(0).unsqueeze(0).repeat_interleave(repeats=batch_size, dim=0)
-        embedding_text = torch.cat((bos_token_embedding, embedding_text[:, 1:, :]), dim=1)
+        bos_token_embedding = bos_token_embedding.repeat_interleave(repeats=seq_len, dim=1)
+        mask_tokens = mask_tokens.unsqueeze(dim=2).repeat_interleave(repeats=self.gpt_embedding_size, dim=2)
+        embedding_text = torch.where(mask_tokens == 50257, bos_token_embedding, embedding_text)
+        # batch_size = embedding_text.size()[0]
+        # bos_token_embedding = self.bos_embedding.unsqueeze(0).unsqueeze(0).repeat_interleave(repeats=batch_size, dim=0)
+        # embedding_text = torch.cat((bos_token_embedding, embedding_text[:, 1:, :]), dim=1)
         # prefix_projections = self.clip_project(prefix).view(-1, self.prefix_length, self.gpt_embedding_size)
         with torch.no_grad():
             prefix = self.image_encode(prefix)
@@ -433,6 +440,11 @@ def val(model, epoch, val_dataloader, args):
         wandb.log({'BLEU_4': result['Bleu_4'], 'METEOR': result['METEOR'], 'ROUGE_L': result['ROUGE_L'], 'CIDEr': result['CIDEr'], 'SPICE': result['SPICE']})
     return result
 
+def sample_time(b, num_timesteps, device):
+    t = torch.randint(0, num_timesteps, (b,), device=device).long()
+
+    return t
+
 
 def train(model, epoch, train_dataloader, optimizer, lr_scheduler, scaler, args,
           output_dir: str = ".", output_prefix: str = ""):
@@ -443,22 +455,31 @@ def train(model, epoch, train_dataloader, optimizer, lr_scheduler, scaler, args,
     print(f">>> Training epoch {epoch}")
     sys.stdout.flush()
     progress = tqdm(total=len(train_dataloader), desc=output_prefix)
-    for idx, (tokens, mask, prefix, gt) in enumerate(train_dataloader):
+    for step_idx, (tokens, mask, prefix, gt) in enumerate(train_dataloader):
         # prefix is raw images
         tokens = tokens.cuda(non_blocking=True)
         mask = mask.cuda(non_blocking=True)
         prefix = prefix.cuda(non_blocking=True)
         gt = gt.cuda(non_blocking=True)
+        t_max = mask.sum(dim=-1).min()
+        b, device = mask.size()[0], mask.device
+        t = sample_time(b, t_max.to(torch.int), device)
+        mask_tokens = torch.full_like(tokens, 50257)
+        gt_mask_tokens = torch.full_like(gt, -1)
+        for idx, evert_t in enumerate(t):
+            if evert_t != 0:
+                mask_tokens[idx, 0:evert_t] = tokens[idx, 0:evert_t]
+            gt_mask_tokens[idx, evert_t] = gt[idx, evert_t]
         with amp.autocast(enabled=args.enable_amp):
-            outputs = model(tokens, prefix, mask)
+            outputs = model(tokens, mask_tokens, prefix, mask)
         logits = outputs.logits
-        loss = nnf.cross_entropy(logits.reshape(-1, logits.shape[-1]), gt.flatten(), ignore_index=-1)
+        loss = nnf.cross_entropy(logits.reshape(-1, logits.shape[-1]), gt_mask_tokens.flatten(), ignore_index=-1)
         
         optimizer.zero_grad()
         scaler.scale(loss).backward() #loss.backward()
         scaler.step(optimizer) #optimizer.step()
         scaler.update()
-        lr_scheduler.step_update(epoch * num_steps + idx)
+        lr_scheduler.step_update(epoch * num_steps + step_idx)
         torch.cuda.synchronize()
         progress.set_postfix({"loss": loss.item(), 'lr': optimizer.param_groups[0]['lr']})
         if dist.get_rank() == 0:
