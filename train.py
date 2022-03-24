@@ -461,14 +461,15 @@ def train(model, epoch, train_dataloader, optimizer, lr_scheduler, scaler, args,
         mask = mask.cuda(non_blocking=True)
         prefix = prefix.cuda(non_blocking=True)
         gt = gt.cuda(non_blocking=True)
-        t_max = mask.sum(dim=-1).min()
+        t_max = mask.sum(dim=-1)
         b, device = mask.size()[0], mask.device
-        t = sample_time(b, t_max.to(torch.int), device)
         mask_tokens = torch.full_like(tokens, 50257)
         gt_mask_tokens = torch.full_like(gt, -1)
-        for idx, evert_t in enumerate(t):
+        for idx in range(b):
+            evert_t = sample_time(b, t_max[idx].to(torch.int), device)
             if evert_t != 0:
                 mask_tokens[idx, 0:evert_t] = tokens[idx, 0:evert_t]
+            mask[idx, evert_t+1:] = 0
             gt_mask_tokens[idx, evert_t] = gt[idx, evert_t]
         with amp.autocast(enabled=args.enable_amp):
             outputs = model(tokens, mask_tokens, prefix, mask)
