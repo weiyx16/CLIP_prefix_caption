@@ -253,7 +253,6 @@ def generate2(
         for entry_idx in range(entry_count):
             mask_feat = model.module.bos_embedding.unsqueeze(0).unsqueeze(0).repeat_interleave(repeats=embed.size(0), dim=0) # bs, 1, dim
             generated = mask_feat
-            tokens_feat = None
             # generated = generated.repeat_interleave(repeats=entry_length, dim=1)
             stop_signal = torch.zeros(embed.size(0)).to(torch.bool).to(device)
             for i in range(entry_length):
@@ -282,10 +281,10 @@ def generate2(
                     tokens = torch.cat((tokens, next_token), dim=1)
                 # for eachbatch in range(embed.size(0)):
                 #     generated[eachbatch, i, :] = next_token_embed[eachbatch, :, :]
-                if tokens_feat is None:
-                    tokens_feat = torch.cat((next_token_embed, mask_feat), dim=1)
+                if i == 0:
+                    generated = torch.cat((next_token_embed, mask_feat), dim=1)
                 else:
-                    tokens_feat = torch.cat((tokens_feat[:, :-1, :], next_token_embed, mask_feat), dim=1)
+                    generated = torch.cat((generated[:, :-1, :], next_token_embed, mask_feat), dim=1)
                 # stop in parallel one...
                 # one case: if all sentences appear eos, then we stop
                 stop_signal = stop_signal | (stop_token_index == next_token).squeeze()
