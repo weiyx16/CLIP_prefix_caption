@@ -57,8 +57,16 @@ class ClipCocoDataset(Dataset):
         # notice the endoftext in tokens is just used as placehold, will be replaced by a learnable bos embedding
         # tokens = torch.cat((torch.tensor(self.tokenizer.encode('<|endoftext|>')), self.captions_tokens[item]), dim=0)
         tokens = torch.cat((self.captions_tokens[item], torch.tensor(self.tokenizer.encode('<|endoftext|>'))), dim=0)
-        gt = torch.cat((self.captions_tokens[item], torch.tensor(self.tokenizer.encode('<|endoftext|>'))), dim=0)
+        _gt = torch.cat((self.captions_tokens[item], torch.tensor(self.tokenizer.encode('<|endoftext|>'))), dim=0)
         padding = self.max_seq_len - tokens.shape[0]
+        evert_t = sample_time(1, tokens.shape[0], tokens.device)
+        # evert_t is 0 to length-1, generate input; 0 means mask 1 to mask 0; length-1 means mask full to mask (l-1)
+        maskids = torch.randperm(tokens.shape[0])[:evert_t+1]
+        tokens[maskids] = 50257 # 50257 will be replaced with a standalone mask token
+        maskids = maskids[-1] # The left one as gt; as previous, we only need this
+        gt = torch.full_like(_gt, -1)
+        gt[maskids] = _gt[maskids]
+
         if padding > 0:
             tokens = torch.cat((tokens, torch.zeros(padding, dtype=torch.int64) - 1))
             gt = torch.cat((gt, torch.zeros(padding, dtype=torch.int64) - 1))  # we set target == -1 as ignore target
@@ -286,16 +294,17 @@ class ClipCaptionModel(nn.Module):
     def get_dummy_token(self, batch_size: int, device: torch.device) -> torch.Tensor:
         return torch.zeros(batch_size, self.prefix_length, dtype=torch.int64, device=device)
 
-    def forward(self, tokens: torch.Tensor, mask_tokens: torch.Tensor, prefix: torch.Tensor, mask: Optional[torch.Tensor] = None,
+    def forward(self, tokens: torch.Tensor, prefix: torch.Tensor, mask: Optional[torch.Tensor] = None,
                 labels: Optional[torch.Tensor] = None):
         self.clip_model.eval()
-        embedding_text = self.gpt.transformer.wte(tokens)
+        embedding_text = self.gpt.transformer.wte(tokens.clamp(0, self.gpt.transformer.wte.weight.shape[0]-1))
         batch_size = embedding_text.size()[0]
         seq_len = embedding_text.size()[1]
+        # bos means mask token here.
         bos_token_embedding = self.bos_embedding.unsqueeze(0).unsqueeze(0).repeat_interleave(repeats=batch_size, dim=0)
         bos_token_embedding = bos_token_embedding.repeat_interleave(repeats=seq_len, dim=1)
-        mask_tokens = mask_tokens.unsqueeze(dim=2).repeat_interleave(repeats=self.gpt_embedding_size, dim=2)
-        embedding_text = torch.where(mask_tokens == 50257, bos_token_embedding, embedding_text)
+        tokens = tokens.unsqueeze(dim=2).repeat_interleave(repeats=self.gpt_embedding_size, dim=2)
+        embedding_text = torch.where(tokens == 50257, bos_token_embedding, embedding_text)
         # batch_size = embedding_text.size()[0]
         # bos_token_embedding = self.bos_embedding.unsqueeze(0).unsqueeze(0).repeat_interleave(repeats=batch_size, dim=0)
         # embedding_text = torch.cat((bos_token_embedding, embedding_text[:, 1:, :]), dim=1)
@@ -436,7 +445,7 @@ def val(model, epoch, val_dataloader, args):
     else:
         result = None
     torch.distributed.barrier()
-    if dist.get_rank() == 0:
+    if not args.no_wandb and dist.get_rank() == 0:
         wandb.log({'BLEU_4': result['Bleu_4'], 'METEOR': result['METEOR'], 'ROUGE_L': result['ROUGE_L'], 'CIDEr': result['CIDEr'], 'SPICE': result['SPICE']})
     return result
 
@@ -461,20 +470,11 @@ def train(model, epoch, train_dataloader, optimizer, lr_scheduler, scaler, args,
         mask = mask.cuda(non_blocking=True)
         prefix = prefix.cuda(non_blocking=True)
         gt = gt.cuda(non_blocking=True)
-        t_max = mask.sum(dim=-1)
         b, device = mask.size()[0], mask.device
-        mask_tokens = torch.full_like(tokens, 50257)
-        gt_mask_tokens = torch.full_like(gt, -1)
-        for idx in range(b):
-            evert_t = sample_time(1, t_max[idx].to(torch.int), device)
-            if evert_t != 0:
-                mask_tokens[idx, 0:evert_t] = tokens[idx, 0:evert_t]
-            mask[idx, evert_t+1:] = 0
-            gt_mask_tokens[idx, evert_t] = gt[idx, evert_t]
         with amp.autocast(enabled=args.enable_amp):
-            outputs = model(tokens, mask_tokens, prefix, mask)
+            outputs = model(tokens, prefix, mask)
         logits = outputs.logits
-        loss = nnf.cross_entropy(logits.reshape(-1, logits.shape[-1]), gt_mask_tokens.flatten(), ignore_index=-1)
+        loss = nnf.cross_entropy(logits.reshape(-1, logits.shape[-1]), gt.flatten(), ignore_index=-1)
         
         optimizer.zero_grad()
         scaler.scale(loss).backward() #loss.backward()
@@ -483,7 +483,7 @@ def train(model, epoch, train_dataloader, optimizer, lr_scheduler, scaler, args,
         lr_scheduler.step_update(epoch * num_steps + step_idx)
         torch.cuda.synchronize()
         progress.set_postfix({"loss": loss.item(), 'lr': optimizer.param_groups[0]['lr']})
-        if dist.get_rank() == 0:
+        if not args.no_wandb and dist.get_rank() == 0:
             wandb.log({'train_loss': loss.item(),
                        'lr': optimizer.param_groups[0]['lr']})
         progress.update()
@@ -512,6 +512,7 @@ def parse_args():
     parser.add_argument('--normalize_prefix', dest='normalize_prefix', action='store_true')
     parser.add_argument('--use_beam_search', action='store_true')
     parser.add_argument('--enable-amp', action='store_true')
+    parser.add_argument('--no-wandb', action='store_true')
     parser.add_argument('--disable-amp', action='store_false', dest='enable_amp')
     parser.set_defaults(enable_amp=True)
 
@@ -524,7 +525,7 @@ def parse_args():
 
 
 def main(args):
-    if dist.get_rank() == 0:
+    if not args.no_wandb and dist.get_rank() == 0:
         wandb.login(key='c26712d8885e3e6742ffd9c311e10870a46a197f')
         run = wandb.init(
             id=args.tag,
