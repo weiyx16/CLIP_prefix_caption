@@ -75,7 +75,7 @@ class ClipCocoDataset(Dataset):
             gt = gt[:self.max_seq_len]
         mask = tokens.ge(0) # mask is zero where we out of sequence
         tokens[~mask] = 0
-        masktoken_ids = [i for i in _maskids[:-1] if i < self.max_seq_len]
+        masktoken_ids = [i.item() for i in _maskids[:-1] if i < self.max_seq_len]
         mask[masktoken_ids] = 0
         mask = mask.float()
         return tokens, mask, gt
