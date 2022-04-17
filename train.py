@@ -1,4 +1,5 @@
 import os
+from re import I
 import torch
 import torch.nn as nn
 import torch.backends.cudnn as cudnn
@@ -23,13 +24,12 @@ import wandb
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.multiprocessing as mp
-import skimage.io as io1
 from PIL import Image
 from PIL import ImageFile
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 import numpy as np
 from lr_scheduler import build_scheduler
-from misc import generate2, generate_beam, evaluate_on_coco_caption
+from misc import generate2, generate_beam, evaluate_on_pure_caption
 
 class MappingType(Enum):
     MLP = 'mlp'
@@ -69,30 +69,27 @@ class ClipCocoDataset(Dataset):
         mask = mask.float()
         return tokens, mask, gt
 
+    def preprocess_x0(self, x0):
+        x0 = x0 / self.text_embedding_all_var
+        return x0
+
     def __getitem__(self, item: int) -> Tuple[torch.Tensor, ...]:
         tokens, mask, gt = self.pad_tokens(item)
-        img_id = self.image_ids[item]
-        # train+restval
-        filename = f"{self.data_root}/train2014/COCO_train2014_{int(img_id):012d}.jpg"
-        try:
-            image = io1.imread(filename)
-        except:
-            filename = f"{self.data_root}/val2014/COCO_val2014_{int(img_id):012d}.jpg"
-            image = io1.imread(filename)
-        image = Image.fromarray(image)
-        image = self.preprocess(image)
         ## this is for pre-computed clip feature
         prefix = self.prefixes[self.caption2embedding[item]]
         if self.normalize_prefix:
             prefix = prefix.float()
             prefix = prefix / prefix.norm(2, -1)
-        return tokens, mask, image, gt
+
+        ## this is for text embedding
+        token_feature = self.preprocess_x0(self.text_embedding_all[item])
+        return tokens, mask, token_feature, gt
 
     def __init__(self, data_root: str, data_path: str,  gpt2_type: str = "gpt2", normalize_prefix=False):
         self.data_root = data_root
-        self.tokenizer = GPT2Tokenizer.from_pretrained(gpt2_type)
+        self.tokenizer = clip._tokenizer
         self.normalize_prefix = normalize_prefix
-        self.preprocess = _transform(224)
+        self.text_embedding_all_var = 0.12
         with open(data_path, 'rb') as f:
             all_data = pickle.load(f)
         print("Data size is %0d" % len(all_data["clip_embedding"]))
@@ -105,10 +102,11 @@ class ClipCocoDataset(Dataset):
             with open(f"{data_path[:-4]}_tokens.pkl", 'rb') as f:
                 self.captions_tokens, self.caption2embedding, self.max_seq_len = pickle.load(f)
         else:
+            print(" inference the clip text tokens ")
             self.captions_tokens = []
             self.caption2embedding = []
             max_seq_len = 0
-            for caption in captions_raw:
+            for caption in tqdm(captions_raw):
                 self.captions_tokens.append(torch.tensor(self.tokenizer.encode(caption['caption']), dtype=torch.int64))
                 self.caption2embedding.append(caption["clip_embedding"]) # just index
                 max_seq_len = max(max_seq_len, self.captions_tokens[-1].shape[0])
@@ -119,26 +117,100 @@ class ClipCocoDataset(Dataset):
         ## notice current one is 40
         self.max_seq_len = min(int(all_len.mean() + all_len.std() * 10), int(all_len.max()))
 
+        ## about clip-text embedding
+        if os.path.isfile(f"{data_path[:-4]}_clip_tokens_embed.pkl"):
+            with open(f"{data_path[:-4]}_clip_tokens_embed.pkl", 'rb') as f:
+                self.text_embedding_all = pickle.load(f)
+        else:
+            print(" inference the clip text embedding ")
+            self.clip_model, _ = clip.load("ViT-B/32", device='cpu', jit=False)
+            self.clip_model.requires_grad_(False)
+            self.text_encode = self.clip_model.encode_text
+            self.clip_model.eval()
+            self.text_embedding_all = []
+            for eci in tqdm(range(len(self.captions_tokens))):
+                tokens = torch.cat((self.captions_tokens[eci], torch.tensor(self.tokenizer.encode('<|endoftext|>'))),
+                                   dim=0)
+                tokens = torch.cat((torch.tensor(self.tokenizer.encode('<|startoftext|>')), tokens), dim=0)
+                with torch.no_grad():
+                    text_embedding = self.text_encode(tokens.unsqueeze(0))
+                self.text_embedding_all.append(text_embedding)
+            if dist.get_rank() == 0:
+                with open(f"{data_path[:-4]}_clip_tokens_embed.pkl", 'wb') as f:
+                    pickle.dump(self.text_embedding_all, f)
+            torch.distributed.barrier()
+        self.text_embedding_all = torch.stack(self.text_embedding_all)
+
 
 class ClipCocoValDataset(Dataset):
 
     def __len__(self) -> int:
-        return len(self.files)
+        return len(self.order_ids)
 
-    def __getitem__(self, item: int):
-        _filename = self.files[item]
-        filename = f"{self.data_root}/val2014/{_filename}"
-        image = io1.imread(filename)
-        image = Image.fromarray(image)
-        image = self.preprocess(image)
-        return image, _filename
+    def preprocess_x0(self, x0):
+        x0 = x0 / self.text_embedding_all_var
+        return x0
 
-    def __init__(self, data_root: str):
+    def __getitem__(self, item: int) -> Tuple[torch.Tensor, ...]:
+        ## this is for text embedding
+        token_feature = self.preprocess_x0(self.text_embedding_all[item])
+        return token_feature, self.order_ids[item]
+
+    def __init__(self, data_root: str, data_path: str):
+        self.tokenizer = clip._tokenizer
+        self.text_embedding_all_var = 0.12
         self.data_root = data_root
         with open('captioneval/coco_val.txt') as f:
             self.files = f.read().splitlines()
-        self.preprocess = _transform(224)
 
+        # load text:
+        annos = json.load(open(os.path.join(data_root, 'annotations', 'captions_val2014.json')))['annotations']
+        self.captions_all = dict()
+        for anno in annos:
+            if anno["image_id"] in self.captions_all:
+                self.captions_all[anno["image_id"]].append(anno["caption"])
+            else:
+                self.captions_all[anno["image_id"]] = [anno["caption"]]
+
+        self.order_ids = []
+        for image_file in self.files:
+            image_id = int(image_file.split('_')[-1].split('.')[0])
+            captions = self.captions_all[image_id]
+            captions.sort()
+            self.order_ids.extend(range(len(self.order_ids), len(self.order_ids)+len(captions)))
+        
+        self.order_ids = self.order_ids[:len(self.order_ids) // dist.get_world_size() * dist.get_world_size()]
+
+        ## about clip-text embedding
+        if os.path.isfile(f"{data_path[:-4]}_clip_tokens_embed_val.pkl"):
+            with open(f"{data_path[:-4]}_clip_tokens_embed_val.pkl", 'rb') as f:
+                self.text_embedding_all = pickle.load(f)
+        else:
+            # torch.Size([25010, 1, 512]) tensor(0.1273)
+            print(" inference the clip text embedding on val set ")
+            self.clip_model, _ = clip.load("ViT-B/32", device='cpu', jit=False)
+            self.clip_model.requires_grad_(False)
+            self.text_encode = self.clip_model.encode_text
+            self.clip_model.eval()
+            self.text_embedding_all = []
+
+            for image_file in tqdm(self.files):
+                image_id = int(image_file.split('_')[-1].split('.')[0])
+                captions = self.captions_all[image_id]
+                captions.sort()
+                for caption in captions:
+                    tokens = torch.tensor(self.tokenizer.encode('<|startoftext|> '+caption+' <|endoftext|>'), dtype=torch.int64)
+                    tokens_pad = torch.zeros(1, 77, dtype=torch.long)
+                    tokens_pad[0, :len(tokens)] = tokens
+                    with torch.no_grad():
+                        text_embedding = self.text_encode(tokens_pad)
+                    self.text_embedding_all.append(text_embedding)
+            if dist.get_rank() == 0:
+                with open(f"{data_path[:-4]}_clip_tokens_embed_val.pkl", 'wb') as f:
+                    pickle.dump(self.text_embedding_all, f)
+            torch.distributed.barrier()
+            
+        self.text_embedding_all = torch.stack(self.text_embedding_all)
 
 class MLP(nn.Module):
 
@@ -287,19 +359,12 @@ class ClipCaptionModel(nn.Module):
 
     def forward(self, tokens: torch.Tensor, prefix: torch.Tensor, mask: Optional[torch.Tensor] = None,
                 labels: Optional[torch.Tensor] = None):
-        self.clip_model.eval()
         embedding_text = self.gpt.transformer.wte(tokens)
-        batch_size = embedding_text.size()[0]
-        bos_token_embedding = self.bos_embedding.unsqueeze(0).unsqueeze(0).repeat_interleave(repeats=batch_size, dim=0)
-        embedding_text = torch.cat((bos_token_embedding, embedding_text[:, 1:, :]), dim=1)
-        # prefix_projections = self.clip_project(prefix).view(-1, self.prefix_length, self.gpt_embedding_size)
-        with torch.no_grad():
-            prefix = self.image_encode(prefix)
-        prefix_projections = self.clip_project(prefix)
+        embedding_text = torch.cat((self.clip_project(prefix), embedding_text[:, 1:, :]), dim=1)
         if labels is not None:
             dummy_token = self.get_dummy_token(tokens.shape[0], tokens.device)
             labels = torch.cat((dummy_token, tokens), dim=1)
-        out = self.gpt(inputs_embeds=embedding_text, labels=labels, attention_mask=mask, encoder_hidden_states=prefix_projections)
+        out = self.gpt(inputs_embeds=embedding_text, labels=labels, attention_mask=mask)
         return out
 
     def __init__(self, prefix_length: int, clip_length: Optional[int] = None, prefix_size: int = 512,
@@ -311,15 +376,15 @@ class ClipCaptionModel(nn.Module):
         configuration = configuration.__dict__.copy()
         configuration.update({'scale_attn_by_inverse_layer_idx': False})
         configuration.update({'reorder_and_upcast_attn': False})
+        configuration.update({'n_embd': prefix_size})
+        configuration.update({'n_head': prefix_size//64})
+        configuration.update({'add_cross_attention': False})
+        configuration.update({'vocab_size': 49152+256}) ## adapt to clip tokenizer
         configuration = GPT2Config(**configuration)
         self.gpt = GPT2LMHeadModel(configuration)
-        self.clip_model, _ = clip.load("ViT-B/32", device='cpu', jit=False)
-        self.clip_model.requires_grad_(False)
-        self.image_encode = self.clip_model.encode_image
         self.gpt_embedding_size = self.gpt.transformer.wte.weight.shape[1]
-        self.bos_embedding = nn.Parameter(torch.randn(self.gpt_embedding_size))
         if mapping_type == MappingType.MLP:
-            self.clip_project = MLP((768, self.gpt_embedding_size // 2,
+            self.clip_project = MLP((prefix_size, self.gpt_embedding_size // 2,
                                      self.gpt_embedding_size ))
         else:
             self.clip_project = TransformerMapper(prefix_size, self.gpt_embedding_size, prefix_length,
@@ -395,15 +460,14 @@ def get_pretrain_param_groups(model, skip_list=(), skip_keywords=()):
 @torch.no_grad()
 def val(model, epoch, val_dataloader, args):
     model.eval()
-    tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+    tokenizer = clip._tokenizer
     print(f">>> Evaling epoch {epoch}")
     sys.stdout.flush()
     progress = tqdm(total=len(val_dataloader), desc=args.tag)
     result_all = []
-    for idx, (image, image_path) in enumerate(val_dataloader):
-        image = image.cuda(non_blocking=True)
+    for idx, (prefix, text_id) in enumerate(val_dataloader):
+        prefix = prefix.cuda(non_blocking=True)
         
-        prefix = model.module.image_encode(image)
         prefix_embed = model.module.clip_project(prefix)
         if args.use_beam_search:
             assert False, "Not check beam search for now"
@@ -414,7 +478,7 @@ def val(model, epoch, val_dataloader, args):
         torch.cuda.synchronize()
         progress.update()
 
-        r = [{'image_id': _image_path, 'result': _text} for _image_path, _text in zip(image_path, generated_text_prefix)]
+        r = [{'text_id': _text_id.item(), 'result': str(_text)} for _text_id, _text in zip(text_id, generated_text_prefix)]
         result_all.extend(r)
     progress.close()
     os.makedirs('.cache', exist_ok=True)
@@ -425,7 +489,7 @@ def val(model, epoch, val_dataloader, args):
         for i in range(dist.get_world_size()):
             part_result = json.load(open(f".cache/tmp-results-{i}.json"))
             result_all.extend(part_result)
-        result = evaluate_on_coco_caption(result_all, os.path.join(args.out_dir, f"{args.tag}-{epoch:03d}-results.json"), os.path.join(args.data_root, 'annotations/captions_val2014.json'))
+        result = evaluate_on_pure_caption(result_all, os.path.join(args.out_dir, f"{args.tag}-{epoch:03d}-results.json"), os.path.join(args.data_root, 'annotations/captions_val2014_puretext.json'))
     else:
         result = None
     torch.distributed.barrier()
@@ -512,7 +576,7 @@ def main(args):
             job_type='coco',
             config=args,
         )
-    prefix_dim = 640 if args.is_rn else 512
+    prefix_dim = 512
     args.mapping_type = {'mlp': MappingType.MLP, 'transformer': MappingType.Transformer}[args.mapping_type]
     if args.only_prefix:
         model = ClipCaptionPrefix(args.prefix_length, clip_length=args.prefix_length_clip, prefix_size=prefix_dim,
@@ -539,7 +603,7 @@ def main(args):
     train_sampler = torch.utils.data.distributed.DistributedSampler(dataset)
     train_dataloader = DataLoader(dataset, batch_size=args.bs, sampler=train_sampler, num_workers=8, pin_memory=True, drop_last=True)
 
-    val_dataset = ClipCocoValDataset(args.data_root)
+    val_dataset = ClipCocoValDataset(args.data_root, args.data)
     val_sampler = torch.utils.data.distributed.DistributedSampler(val_dataset, shuffle=False)
     val_dataloader = DataLoader(val_dataset, batch_size=args.bs, sampler=val_sampler, num_workers=8, pin_memory=True, drop_last=False)
     

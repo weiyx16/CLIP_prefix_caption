@@ -251,10 +251,10 @@ def generate2(
 
     with torch.no_grad():
         for entry_idx in range(entry_count):
-            generated = model.module.bos_embedding.unsqueeze(0).unsqueeze(0).repeat_interleave(repeats=embed.size(0), dim=0) # bs, 1, dim
+            generated = embed
             stop_signal = torch.zeros(embed.size(0)).to(torch.bool).to(device)
             for i in range(entry_length):
-                outputs = model.module.gpt(inputs_embeds=generated, encoder_hidden_states=embed)
+                outputs = model.module.gpt(inputs_embeds=generated)
                 logits = outputs.logits
                 # we only need the last (newest) token, so using -1 will be ok.
                 logits = logits[:, -1, :] / (temperature if temperature > 0 else 1.0) # bs, vocab
@@ -375,6 +375,34 @@ def evaluate_on_coco_caption(results, res_file, label_file, outfile=None):
     # evaluate results
     # SPICE will take a few minutes the first time, but speeds up due to caching
     cocoEval.evaluate()
+    result = cocoEval.eval
+    result = {k: v*100 for k,v in result.items()}
+    if not outfile:
+        print(result)
+    else:
+        if ((dist.is_initialized() or dist.is_available()) and int(dist.get_rank()) == 0) or not dist.is_available():
+            with open(outfile, 'w') as fp:
+                json.dump(result, fp, indent=4)
+    return result
+
+
+def evaluate_on_pure_caption(results, res_file, label_file, outfile=None):
+    assert label_file.endswith('.json')
+    gt_res = json.load(open(label_file, 'r'))[:len(results)]
+    parsed_res = [""] * len(results)
+    for result in results:
+        cap = str(result['result'].split('<|endoftext|>')[0].strip())
+        text_id = result['text_id']
+        parsed_res[text_id] = cap
+    if ((dist.is_initialized() or dist.is_available()) and int(dist.get_rank()) == 0) or not dist.is_available():
+        json.dump(parsed_res, open(res_file, 'w'))
+    assert len(gt_res) == len(parsed_res), f"the number of labeled sentences is not equal to the one of predicted: gt: {len(gt_res)}, pred: {len(parsed_res)}"
+
+    cocoEval = COCOEvalCap(gt_res, parsed_res, 'corpus')
+
+    # evaluate results
+    # SPICE will take a few minutes the first time, but speeds up due to caching
+    cocoEval.puretext_evaluate()
     result = cocoEval.eval
     result = {k: v*100 for k,v in result.items()}
     if not outfile:
