@@ -69,9 +69,29 @@ class ClipCocoDataset(Dataset):
         mask = mask.float()
         return tokens, mask, gt
 
+    def _extract_into_tensor(self, arr, timesteps, broadcast_shape):
+        """
+        Extract values from a 1-D numpy array for a batch of indices.
+        :param arr: the 1-D numpy array.
+        :param timesteps: a tensor of indices into the array to extract.
+        :param broadcast_shape: a larger shape of K dimensions with the batch
+                                dimension equal to the length of timesteps.
+        :return: a tensor of shape [batch_size, 1, ...] where the shape has K dims.
+        """
+        res = torch.from_numpy(arr).to(device=timesteps.device)[timesteps].float()
+        while len(res.shape) < len(broadcast_shape):
+            res = res[..., None]
+        return res + torch.zeros(broadcast_shape, device=timesteps.device)
+
     def preprocess_x0(self, x0):
         x0 = x0 / self.text_embedding_all_var
-        return x0
+        weights = np.cos(np.linspace(0, np.pi/2, self.num_timesteps))
+        t = torch.multinomial(torch.tensor(weights), x0.size(0), replacement=True)
+        noise = torch.randn_like(x0)
+        return (
+            self._extract_into_tensor(self.sqrt_alphas_cumprod, t, x0.shape) * x0
+            + self._extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, x0.shape) * noise
+        )
 
     def __getitem__(self, item: int) -> Tuple[torch.Tensor, ...]:
         tokens, mask, gt = self.pad_tokens(item)
@@ -141,6 +161,14 @@ class ClipCocoDataset(Dataset):
             torch.distributed.barrier()
         self.text_embedding_all = torch.stack(self.text_embedding_all)
 
+        # simulate noise term in diffusion:
+        self.num_timesteps = 1000
+        betas = np.linspace(0.0001, 0.02, self.num_timesteps, dtype=np.float64)
+
+        alphas = 1.0 - betas
+        self.alphas_cumprod = np.cumprod(alphas, axis=0)
+        self.sqrt_alphas_cumprod = np.sqrt(self.alphas_cumprod)
+        self.sqrt_one_minus_alphas_cumprod = np.sqrt(1.0 - self.alphas_cumprod)
 
 class ClipCocoValDataset(Dataset):
 
