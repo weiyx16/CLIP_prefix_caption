@@ -228,12 +228,13 @@ class VisualTransformer(nn.Module):
         x = self.transformer(x)
         x = x.permute(1, 0, 2)  # LND -> NLD
 
-        # x = self.ln_post(x[:, 0, :])
-        #
-        # if self.proj is not None:
-        #     x = x @ self.proj
+        x = self.ln_post(x[:, 0, :])
+        
+        if self.proj is not None:
+            x = x @ self.proj
 
-        return x[:, 1:, :]
+        return x
+        # return x[:, 1:, :]
 
 
 class CLIP(nn.Module):

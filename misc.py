@@ -251,10 +251,10 @@ def generate2(
 
     with torch.no_grad():
         for entry_idx in range(entry_count):
-            generated = model.module.bos_embedding.unsqueeze(0).unsqueeze(0).repeat_interleave(repeats=embed.size(0), dim=0) # bs, 1, dim
+            generated = embed.unsqueeze(1)
             stop_signal = torch.zeros(embed.size(0)).to(torch.bool).to(device)
             for i in range(entry_length):
-                outputs = model.module.gpt(inputs_embeds=generated, encoder_hidden_states=embed)
+                outputs = model.module.gpt(inputs_embeds=generated)
                 logits = outputs.logits
                 # we only need the last (newest) token, so using -1 will be ok.
                 logits = logits[:, -1, :] / (temperature if temperature > 0 else 1.0) # bs, vocab

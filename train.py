@@ -113,8 +113,10 @@ class ClipCocoDataset(Dataset):
                 self.caption2embedding.append(caption["clip_embedding"]) # just index
                 max_seq_len = max(max_seq_len, self.captions_tokens[-1].shape[0])
             # self.max_seq_len = max_seq_len
-            with open(f"{data_path[:-4]}_tokens.pkl", 'wb') as f:
-                pickle.dump([self.captions_tokens, self.caption2embedding, max_seq_len], f)
+            if dist.get_rank() == 0:
+                with open(f"{data_path[:-4]}_tokens.pkl", 'wb') as f:
+                    pickle.dump([self.captions_tokens, self.caption2embedding, max_seq_len], f)
+            torch.distributed.barrier()
         all_len = torch.tensor([len(self.captions_tokens[i]) for i in range(len(self))]).float()
         ## notice current one is 40
         self.max_seq_len = min(int(all_len.mean() + all_len.std() * 10), int(all_len.max()))
@@ -289,17 +291,14 @@ class ClipCaptionModel(nn.Module):
                 labels: Optional[torch.Tensor] = None):
         self.clip_model.eval()
         embedding_text = self.gpt.transformer.wte(tokens)
-        batch_size = embedding_text.size()[0]
-        bos_token_embedding = self.bos_embedding.unsqueeze(0).unsqueeze(0).repeat_interleave(repeats=batch_size, dim=0)
-        embedding_text = torch.cat((bos_token_embedding, embedding_text[:, 1:, :]), dim=1)
-        # prefix_projections = self.clip_project(prefix).view(-1, self.prefix_length, self.gpt_embedding_size)
         with torch.no_grad():
             prefix = self.image_encode(prefix)
         prefix_projections = self.clip_project(prefix)
+        embedding_text = torch.cat((prefix_projections.unsqueeze(1), embedding_text[:, 1:, :]), dim=1)
         if labels is not None:
             dummy_token = self.get_dummy_token(tokens.shape[0], tokens.device)
             labels = torch.cat((dummy_token, tokens), dim=1)
-        out = self.gpt(inputs_embeds=embedding_text, labels=labels, attention_mask=mask, encoder_hidden_states=prefix_projections)
+        out = self.gpt(inputs_embeds=embedding_text, labels=labels, attention_mask=mask)
         return out
 
     def __init__(self, prefix_length: int, clip_length: Optional[int] = None, prefix_size: int = 512,
@@ -311,15 +310,15 @@ class ClipCaptionModel(nn.Module):
         configuration = configuration.__dict__.copy()
         configuration.update({'scale_attn_by_inverse_layer_idx': False})
         configuration.update({'reorder_and_upcast_attn': False})
+        configuration.update({'add_cross_attention': False})
         configuration = GPT2Config(**configuration)
         self.gpt = GPT2LMHeadModel(configuration)
         self.clip_model, _ = clip.load("ViT-B/32", device='cpu', jit=False)
         self.clip_model.requires_grad_(False)
         self.image_encode = self.clip_model.encode_image
         self.gpt_embedding_size = self.gpt.transformer.wte.weight.shape[1]
-        self.bos_embedding = nn.Parameter(torch.randn(self.gpt_embedding_size))
         if mapping_type == MappingType.MLP:
-            self.clip_project = MLP((768, self.gpt_embedding_size // 2,
+            self.clip_project = MLP((512, self.gpt_embedding_size // 2,
                                      self.gpt_embedding_size ))
         else:
             self.clip_project = TransformerMapper(prefix_size, self.gpt_embedding_size, prefix_length,
