@@ -29,7 +29,7 @@ from PIL import ImageFile
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 import numpy as np
 from lr_scheduler import build_scheduler
-from misc import generate2, generate_beam, evaluate_on_pure_caption
+from misc import generate2, generate_beam, evaluate_on_pure_caption, evaluate_on_coco_caption
 
 class MappingType(Enum):
     MLP = 'mlp'
@@ -88,10 +88,12 @@ class ClipCocoDataset(Dataset):
         weights = np.cos(np.linspace(0, np.pi/2, self.num_timesteps))
         t = torch.multinomial(torch.tensor(weights), x0.size(0), replacement=True)
         noise = torch.randn_like(x0)
-        return (
+        x0_noise = (
             self._extract_into_tensor(self.sqrt_alphas_cumprod, t, x0.shape) * x0
             + self._extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, x0.shape) * noise
         )
+        # print(t, x0 / x0.norm(p=2) @ (x0_noise / x0_noise.norm(p=2)).t())
+        return x0_noise
 
     def __getitem__(self, item: int) -> Tuple[torch.Tensor, ...]:
         tokens, mask, gt = self.pad_tokens(item)
@@ -239,6 +241,33 @@ class ClipCocoValDataset(Dataset):
             torch.distributed.barrier()
             
         self.text_embedding_all = torch.stack(self.text_embedding_all)
+
+class ClipCocoValStage2Dataset(Dataset):
+    """
+        Don't take gt emb as input, but take predicted prior as input, for testing prior network
+    """
+
+    def __len__(self) -> int:
+        return len(self.files)
+
+    def preprocess_x0(self, x0):
+        x0 = x0 / self.text_embedding_all_var
+        return x0
+
+    def __getitem__(self, item: int) -> Tuple[torch.Tensor, ...]:
+        ## this is for text embedding
+        token_feature = self.preprocess_x0(self.text_embedding_all[item])
+        return token_feature, self.files[item]
+
+    def __init__(self, data_root: str, data_path: str):
+        self.tokenizer = clip._tokenizer
+        self.text_embedding_all_var = 1.0
+        self.data_root = data_root
+        with open('captioneval/coco_val.txt') as f:
+            self.files = f.read().splitlines()
+
+        ## about pred_clip-text embedding
+        self.text_embedding_all = torch.load(f"{data_path[:-4]}_clip_tokens_embed_val_predbyprior.pkl").unsqueeze(1)
 
 class MLP(nn.Module):
 
@@ -450,8 +479,8 @@ def load_model(model, args, epoch_or_latest: Union[str, int] = '_latest'):
         epoch_or_latest = f"-{epoch_or_latest:03d}"
     model_path = os.path.join(args.out_dir, f"{args.tag}{epoch_or_latest}.pt")
     if os.path.isfile(model_path):
-        print(f"loading model from {model_path}")
-        model.load_state_dict(torch.load(model_path, map_location=torch.device('cpu'))["model"])
+        msg = model.load_state_dict(torch.load(model_path, map_location=torch.device('cpu'))["model"])
+        print(f"loading model from {model_path}, with msg: {msg}")
     else:
         print(f"{model_path} is not exist")
     return model
@@ -483,6 +512,47 @@ def get_pretrain_param_groups(model, skip_list=(), skip_keywords=()):
     print(f'Has decay params: {has_decay_name}')
     return [{'params': has_decay},
             {'params': no_decay, 'weight_decay': 0.}]
+
+
+@torch.no_grad()
+def val_prior(model, val_dataloader, args):
+    model.eval()
+    tokenizer = clip._tokenizer
+    print(f">>> Evaling Prior Model")
+    sys.stdout.flush()
+    progress = tqdm(total=len(val_dataloader), desc=args.tag)
+    result_all = []
+    for idx, (prefix, image_path) in enumerate(val_dataloader):
+        prefix = prefix.cuda(non_blocking=True)
+        
+        prefix_embed = model.module.clip_project(prefix)
+        if args.use_beam_search:
+            assert False, "Not check beam search for now"
+            generated_text_prefix = generate_beam(model, tokenizer, embed=prefix_embed)[0]
+        else:
+            generated_text_prefix = generate2(model, tokenizer, embed=prefix_embed)
+
+        torch.cuda.synchronize()
+        progress.update()
+
+        r = [{'image_id': _image_path, 'result': str(_text)} for _image_path, _text in zip(image_path, generated_text_prefix)]
+        result_all.extend(r)
+    progress.close()
+    os.makedirs('.cache', exist_ok=True)
+    json.dump(result_all, open(f".cache/tmp-results-{dist.get_rank()}.json", "w"))
+    torch.distributed.barrier()
+    if dist.get_rank() == 0:
+        result_all = []
+        for i in range(dist.get_world_size()):
+            part_result = json.load(open(f".cache/tmp-results-{i}.json"))
+            result_all.extend(part_result)
+        result = evaluate_on_coco_caption(result_all, os.path.join(args.out_dir, f"{args.tag}-priormodel-results.json"), os.path.join(args.data_root, 'annotations/captions_val2014.json'))
+    else:
+        result = None
+    torch.distributed.barrier()
+    if dist.get_rank() == 0:
+        wandb.log({'BLEU_4': result['Bleu_4'], 'METEOR': result['METEOR'], 'ROUGE_L': result['ROUGE_L'], 'CIDEr': result['CIDEr'], 'SPICE': result['SPICE']})
+    return result
 
 
 @torch.no_grad()
@@ -581,6 +651,7 @@ def parse_args():
     parser.add_argument('--is_rn', dest='is_rn', action='store_true')
     parser.add_argument('--normalize_prefix', dest='normalize_prefix', action='store_true')
     parser.add_argument('--use_beam_search', action='store_true')
+    parser.add_argument('--eval-prior', action='store_true', help='eval prior model only')
     parser.add_argument('--enable-amp', action='store_true')
     parser.add_argument('--disable-amp', action='store_false', dest='enable_amp')
     parser.set_defaults(enable_amp=True)
@@ -626,6 +697,17 @@ def main(args):
     optimizer = AdamW(parameters, lr=args.lr, weight_decay=args.wd)
     scaler = amp.GradScaler()
     model = DDP(model, device_ids=[local_rank], broadcast_buffers=False)
+
+    if args.eval_prior:
+        # load model
+        model_without_ddp = model.module
+        _ = load_model(model_without_ddp, args, epoch_or_latest=args.epochs-1)
+        # build Dataset
+        val_dataset = ClipCocoValStage2Dataset(args.data_root, args.data)
+        val_sampler = torch.utils.data.distributed.DistributedSampler(val_dataset, shuffle=False)
+        val_dataloader = DataLoader(val_dataset, batch_size=args.bs, sampler=val_sampler, num_workers=8, pin_memory=True, drop_last=False)   
+        result = val_prior(model, val_dataloader, args)
+        return
 
     dataset = ClipCocoDataset(args.data_root, args.data, normalize_prefix=args.normalize_prefix)
     train_sampler = torch.utils.data.distributed.DistributedSampler(dataset)
