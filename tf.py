@@ -115,6 +115,31 @@ def load_tf_weights_in_gpt2(model, config, gpt2_checkpoint_path):
     return model
 
 
+class mySiLU(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.sigmoid = nn.Sigmoid()
+    def forward(self, x):
+        return x * self.sigmoid(x)
+
+class AdaLayerNorm(nn.Module):
+    def __init__(self, n_embd, eps=1e-8):
+        super().__init__()
+        try:
+            self.silu = nn.SiLU()
+        except:
+            self.silu = mySiLU()
+        self.emb = nn.Linear(n_embd, n_embd)
+        self.linear = nn.Linear(n_embd, n_embd*2)
+        # notice, the weight and
+        self.layernorm = nn.LayerNorm(n_embd, eps=eps, elementwise_affine=False)
+
+    def forward(self, x, condition):
+        emb = self.linear(self.silu(self.emb(condition))).unsqueeze(1)
+        scale, shift = torch.chunk(emb, 2, dim=2)
+        x = self.layernorm(x) * (1 + scale) + shift
+        return x
+
 class GPT2Attention(nn.Module):
     def __init__(self, config, is_cross_attention=False, layer_idx=None):
         super().__init__()
@@ -352,15 +377,20 @@ class GPT2Block(nn.Module):
         hidden_size = config.hidden_size
         inner_dim = config.n_inner if config.n_inner is not None else 4 * hidden_size
 
-        self.ln_1 = nn.LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
+        if getattr(config, 'use_adaln', False):
+            self.ln_1 = AdaLayerNorm(hidden_size, eps=config.layer_norm_epsilon)
+            self.ln_2 = AdaLayerNorm(hidden_size, eps=config.layer_norm_epsilon)
+        else:
+            self.ln_1 = nn.LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
+            self.ln_2 = nn.LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
         self.attn = GPT2Attention(config, layer_idx=layer_idx)
-        self.ln_2 = nn.LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
 
         if config.add_cross_attention:
             self.crossattention = GPT2Attention(config, is_cross_attention=True)
             self.ln_cross_attn = nn.LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
 
         self.mlp = GPT2MLP(inner_dim, config)
+        self.adaln = getattr(config, 'use_adaln', False)
 
     def forward(
         self,
@@ -368,13 +398,17 @@ class GPT2Block(nn.Module):
         layer_past=None,
         attention_mask=None,
         head_mask=None,
+        adaln=None,
         encoder_hidden_states=None,
         encoder_attention_mask=None,
         use_cache=False,
         output_attentions=False,
     ):
         residual = hidden_states
-        hidden_states = self.ln_1(hidden_states)
+        if self.adaln:
+            hidden_states = self.ln_1(hidden_states, adaln)
+        else:
+            hidden_states = self.ln_1(hidden_states)
         attn_outputs = self.attn(
             hidden_states,
             layer_past=layer_past,
@@ -411,7 +445,10 @@ class GPT2Block(nn.Module):
             outputs = outputs + cross_attn_outputs[2:]  # add cross attentions if we output attention weights
 
         residual = hidden_states
-        hidden_states = self.ln_2(hidden_states)
+        if self.adaln:
+            hidden_states = self.ln_2(hidden_states, adaln)
+        else:
+            hidden_states = self.ln_2(hidden_states)
         feed_forward_hidden_states = self.mlp(hidden_states)
         # residual connection
         hidden_states = residual + feed_forward_hidden_states
@@ -452,9 +489,11 @@ class GPT2PreTrainedModel(PreTrainedModel):
             if module.padding_idx is not None:
                 module.weight.data[module.padding_idx].zero_()
         elif isinstance(module, nn.LayerNorm):
-            module.bias.data.zero_()
-            module.weight.data.fill_(1.0)
-
+            try:
+                module.bias.data.zero_()
+                module.weight.data.fill_(1.0)
+            except:
+                pass
         # Reinitialize selected weights subject to the OpenAI GPT-2 Paper Scheme:
         #   > A modified initialization which accounts for the accumulation on the residual path with model depth. Scale
         #   > the weights of residual layers at initialization by a factor of 1/��N where N is the # of residual layers.
@@ -732,6 +771,7 @@ class GPT2Model(GPT2PreTrainedModel):
         token_type_ids=None,
         position_ids=None,
         head_mask=None,
+        adaln=None,
         inputs_embeds=None,
         encoder_hidden_states=None,
         encoder_attention_mask=None,
@@ -875,6 +915,7 @@ class GPT2Model(GPT2PreTrainedModel):
                     layer_past=layer_past,
                     attention_mask=attention_mask,
                     head_mask=head_mask[i],
+                    adaln=adaln,
                     encoder_hidden_states=encoder_hidden_states,
                     encoder_attention_mask=encoder_attention_mask,
                     use_cache=use_cache,
@@ -1014,6 +1055,7 @@ class GPT2LMHeadModel(GPT2PreTrainedModel):
         encoder_hidden_states=None,
         encoder_attention_mask=None,
         labels=None,
+        adaln=None,
         use_cache=None,
         output_attentions=None,
         output_hidden_states=None,
@@ -1034,6 +1076,7 @@ class GPT2LMHeadModel(GPT2PreTrainedModel):
             token_type_ids=token_type_ids,
             position_ids=position_ids,
             head_mask=head_mask,
+            adaln=adaln,
             inputs_embeds=inputs_embeds,
             encoder_hidden_states=encoder_hidden_states,
             encoder_attention_mask=encoder_attention_mask,

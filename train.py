@@ -291,14 +291,16 @@ class ClipCaptionModel(nn.Module):
                 labels: Optional[torch.Tensor] = None):
         self.clip_model.eval()
         embedding_text = self.gpt.transformer.wte(tokens)
+        batch_size = embedding_text.size()[0]
+        bos_token_embedding = self.bos_embedding.unsqueeze(0).unsqueeze(0).repeat_interleave(repeats=batch_size, dim=0)
+        embedding_text = torch.cat((bos_token_embedding, embedding_text[:, 1:, :]), dim=1)
         with torch.no_grad():
             prefix = self.image_encode(prefix)
         prefix_projections = self.clip_project(prefix)
-        embedding_text = torch.cat((prefix_projections.unsqueeze(1), embedding_text[:, 1:, :]), dim=1)
         if labels is not None:
             dummy_token = self.get_dummy_token(tokens.shape[0], tokens.device)
             labels = torch.cat((dummy_token, tokens), dim=1)
-        out = self.gpt(inputs_embeds=embedding_text, labels=labels, attention_mask=mask)
+        out = self.gpt(inputs_embeds=embedding_text, labels=labels, attention_mask=mask, adaln=prefix_projections)
         return out
 
     def __init__(self, prefix_length: int, clip_length: Optional[int] = None, prefix_size: int = 512,
@@ -311,12 +313,14 @@ class ClipCaptionModel(nn.Module):
         configuration.update({'scale_attn_by_inverse_layer_idx': False})
         configuration.update({'reorder_and_upcast_attn': False})
         configuration.update({'add_cross_attention': False})
+        configuration.update({'use_adaln': True})
         configuration = GPT2Config(**configuration)
         self.gpt = GPT2LMHeadModel(configuration)
         self.clip_model, _ = clip.load("ViT-B/32", device='cpu', jit=False)
         self.clip_model.requires_grad_(False)
         self.image_encode = self.clip_model.encode_image
         self.gpt_embedding_size = self.gpt.transformer.wte.weight.shape[1]
+        self.bos_embedding = nn.Parameter(torch.randn(self.gpt_embedding_size))
         if mapping_type == MappingType.MLP:
             self.clip_project = MLP((512, self.gpt_embedding_size // 2,
                                      self.gpt_embedding_size ))
