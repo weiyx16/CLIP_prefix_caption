@@ -236,7 +236,7 @@ def generate2(
         prompt=None,
         embed=None,
         entry_count=1,
-        entry_length=67,  # maximum number of words
+        entry_length=20,  # maximum number of words
         top_p=0.8,
         temperature=1.,
         stop_token: str = '<|endoftext|>',
@@ -251,47 +251,22 @@ def generate2(
 
     with torch.no_grad():
         for entry_idx in range(entry_count):
-            generated = embed.unsqueeze(1)
-            stop_signal = torch.zeros(embed.size(0)).to(torch.bool).to(device)
-            for i in range(entry_length):
-                outputs = model.module.gpt(inputs_embeds=generated)
-                logits = outputs.logits
-                # we only need the last (newest) token, so using -1 will be ok.
-                logits = logits[:, -1, :] / (temperature if temperature > 0 else 1.0) # bs, vocab
-                sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-                cumulative_probs = torch.cumsum(nnf.softmax(sorted_logits, dim=-1), dim=-1)
-                sorted_indices_to_remove = cumulative_probs > top_p
-                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[
-                                                    ..., :-1
-                                                    ].clone()
-                sorted_indices_to_remove[..., 0] = 0 # incase of one word with > top_p prob
+            generated = model.module.mask_embedding.unsqueeze(0).unsqueeze(0).repeat_interleave(repeats=embed.size(0), dim=0) # bs, 1, dim
+            noise_feature = torch.randn_like(generated)
+            for i in list(range(model.module.time_step))[::-1]:
+                t = torch.tensor([i] * embed.size(0), device=device)
+                t_embedding = model.module.t_embedding(t).unsqueeze(1)
+                all_embedding = torch.cat([embed.unsqueeze(1), t_embedding, noise_feature, generated], dim=1)
+                out = model.module.p_mean_variance(model.module.gpt, all_embedding, t)
+                noise = torch.randn_like(generated).squeeze(1)
+                nonzero_mask = (
+                    (t != 0).float().view(-1, *([1] * (len(generated.shape) - 1)))
+                ).squeeze(1)  # no noise when t == 0
+                sample = out["mean"] + nonzero_mask * torch.exp(0.5 * out["log_variance"]) * noise
+                noise_feature = sample.unsqueeze(1)
+            pre_x0_final = sample
 
-                # indices_to_remove = sorted_indices[sorted_indices_to_remove]
-                # logits[:, indices_to_remove] = filter_value
-                for ele in range(logits.size(0)):
-                    logits[ele, sorted_indices[ele, sorted_indices_to_remove[ele]]] = filter_value
-                next_token = torch.argmax(logits, -1)
-                next_token_embed = model.module.gpt.transformer.wte(next_token).unsqueeze(1) # bs, 1, dim
-                next_token = next_token.unsqueeze(1) # bs, 1
-                if tokens is None:
-                    tokens = next_token
-                else:
-                    tokens = torch.cat((tokens, next_token), dim=1)
-                generated = torch.cat((generated, next_token_embed), dim=1)
-                # stop in parallel one...
-                # one case: if all sentences appear eos, then we stop
-                stop_signal = stop_signal | (stop_token_index == next_token).squeeze()
-                if torch.all(stop_signal):
-                    break
-            output_list = list(tokens.cpu().numpy()) # bs, entry_length
-            output_text =[tokenizer.decode(_output_list) for _output_list in output_list]
-            generated_list.append(output_text)
-
-    return generated_list[0]
-
-
-# Copyright (c) 2020 Microsoft Corporation. Licensed under the MIT license. 
-# from: https://github.com/microsoft/Oscar/blob/4788a7425cd0f9861ea80fed79528abbb72eb169/oscar/utils/caption_evaluate.py
+    return pre_x0_final
 
 from collections import OrderedDict, defaultdict
 import json

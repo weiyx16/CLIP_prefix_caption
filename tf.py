@@ -656,8 +656,8 @@ class GPT2Model(GPT2PreTrainedModel):
 
         self.embed_dim = config.hidden_size
 
-        self.wte = nn.Embedding(config.vocab_size, self.embed_dim)
-        self.wpe = nn.Embedding(config.max_position_embeddings, self.embed_dim)
+        # self.wte = nn.Embedding(config.vocab_size, self.embed_dim)
+        # self.wpe = nn.Embedding(config.max_position_embeddings, self.embed_dim)
 
         self.drop = nn.Dropout(config.embd_pdrop)
         self.h = nn.ModuleList([GPT2Block(config, layer_idx=i) for i in range(config.num_hidden_layers)])
@@ -681,8 +681,8 @@ class GPT2Model(GPT2PreTrainedModel):
         self.model_parallel = True
         self.first_device = "cpu" if "cpu" in self.device_map.keys() else "cuda:" + str(min(self.device_map.keys()))
         self.last_device = "cuda:" + str(max(self.device_map.keys()))
-        self.wte = self.wte.to(self.first_device)
-        self.wpe = self.wpe.to(self.first_device)
+        # self.wte = self.wte.to(self.first_device)
+        # self.wpe = self.wpe.to(self.first_device)
         # Load onto devices
         for k, v in self.device_map.items():
             for block in v:
@@ -697,18 +697,18 @@ class GPT2Model(GPT2PreTrainedModel):
         self.device_map = None
         self.first_device = "cpu"
         self.last_device = "cpu"
-        self.wte = self.wte.to("cpu")
-        self.wpe = self.wpe.to("cpu")
+        # self.wte = self.wte.to("cpu")
+        # self.wpe = self.wpe.to("cpu")
         for index in range(len(self.h)):
             self.h[index] = self.h[index].to("cpu")
         self.ln_f = self.ln_f.to("cpu")
         torch.cuda.empty_cache()
 
-    def get_input_embeddings(self):
-        return self.wte
+    # def get_input_embeddings(self):
+    #     return self.wte
 
-    def set_input_embeddings(self, new_embeddings):
-        self.wte = new_embeddings
+    # def set_input_embeddings(self, new_embeddings):
+    #     self.wte = new_embeddings
 
     def _prune_heads(self, heads_to_prune):
         """
@@ -812,14 +812,11 @@ class GPT2Model(GPT2PreTrainedModel):
         # head_mask has shape n_layer x batch x n_heads x N x N
         head_mask = self.get_head_mask(head_mask, self.config.n_layer)
 
-        if inputs_embeds is None:
-            inputs_embeds = self.wte(input_ids)
-        position_embeds = self.wpe(position_ids)
-        hidden_states = inputs_embeds + position_embeds
-
-        if token_type_ids is not None:
-            token_type_embeds = self.wte(token_type_ids)
-            hidden_states = hidden_states + token_type_embeds
+        # if inputs_embeds is None:
+        #     inputs_embeds = self.wte(input_ids)
+        # position_embeds = self.wpe(position_ids)
+        # hidden_states = inputs_embeds + position_embeds
+        hidden_states = inputs_embeds
 
         hidden_states = self.drop(hidden_states)
 
