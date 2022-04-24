@@ -624,7 +624,7 @@ def val(model, epoch, val_dataloader, args):
         captions = [list(per_cap) for per_cap in zip(*captions)] # the original captions are 5*bs
         for sample_idx, img_captions in enumerate(captions):
             tokens = tokenize(img_captions, add_start_and_end=True)['token']
-            text_embedding = model.module.text_encode(tokens.cuda()) # 5*512
+            text_embedding = model.module.text_encode(tokens.cuda()) / val_dataloader.dataset.text_embedding_all_var # 5*512
             cos_pre_self += nnf.cosine_similarity(text_embedding, generated_text_prefix[sample_idx].unsqueeze(0).repeat(text_embedding.size(0), 1), dim=1, eps=1e-6).mean() / generated_text_prefix.size(0)
         cos_pre += nnf.cosine_similarity(prefix_embed, generated_text_prefix, dim=1, eps=1e-6).mean()   
     progress.close()
