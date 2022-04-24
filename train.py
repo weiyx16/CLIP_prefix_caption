@@ -17,7 +17,7 @@ import argparse
 import json
 from typing import Tuple, Optional, Union
 from clip1 import clip
-from clip1.clip import _transform
+from clip1.clip import _transform, tokenize
 import math
 import wandb
 import torch.distributed as dist
@@ -620,18 +620,10 @@ def val(model, epoch, val_dataloader, args):
         r = [{'image_id': _image_path, 'feature': _generated_text_prefix} for _image_path, _generated_text_prefix in zip(image_path, generated_text_prefix_cpu)]
         result_all.extend(r)
         # valiation metrics
-        for sample_idx, img_captions in tqdm(enumerate(captions)):
-            per_text_embedding = []
-            for caption in img_captions:
-                tokens = torch.cat((torch.tensor(tokenizer.encode('<|startoftext|>')), 
-                                    torch.tensor(tokenizer.encode(caption)), 
-                                    torch.tensor(tokenizer.encode('<|endoftext|>'))),
-                                    dim=0)
-                text_embedding = model.module.text_encode(tokens.unsqueeze(0))
-                per_text_embedding.append(text_embedding)
-            per_text_embedding = torch.stack(per_text_embedding, dim=0) # 5*512
-            
-            cos_pre_self += nnf.cosine_similarity(per_text_embedding, generated_text_prefix[sample_idx].unsqueeze(0).repeat(per_text_embedding.size(0), 1), dim=1, eps=1e-6).mean() / generated_text_prefix.size(0)
+        for sample_idx, img_captions in enumerate(captions):
+            tokens = tokenize(img_captions, add_start_and_end=True)['token']
+            text_embedding = model.module.text_encode(tokens.cuda()) # 5*512
+            cos_pre_self += nnf.cosine_similarity(text_embedding, generated_text_prefix[sample_idx].unsqueeze(0).repeat(text_embedding.size(0), 1), dim=1, eps=1e-6).mean() / generated_text_prefix.size(0)
         cos_pre += nnf.cosine_similarity(prefix_embed, generated_text_prefix, dim=1, eps=1e-6).mean()   
     progress.close()
     os.makedirs('.cache', exist_ok=True)
@@ -771,6 +763,7 @@ def main(args):
     lr_scheduler = build_scheduler(lr_args, optimizer, len(train_dataloader))
     
     for epoch in range(args.epochs):
+        result = val(model, epoch, val_dataloader, args)
         _ = train(model, epoch, train_dataloader, optimizer, lr_scheduler, scaler, args, output_dir=args.out_dir, output_prefix=args.tag)
         result = val(model, epoch, val_dataloader, args)
         if epoch % args.save_every == 0 or epoch == args.epochs - 1:
