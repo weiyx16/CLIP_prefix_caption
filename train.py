@@ -763,7 +763,6 @@ def main(args):
     lr_scheduler = build_scheduler(lr_args, optimizer, len(train_dataloader))
     
     for epoch in range(args.epochs):
-        result = val(model, epoch, val_dataloader, args)
         _ = train(model, epoch, train_dataloader, optimizer, lr_scheduler, scaler, args, output_dir=args.out_dir, output_prefix=args.tag)
         result = val(model, epoch, val_dataloader, args)
         if epoch % args.save_every == 0 or epoch == args.epochs - 1:
