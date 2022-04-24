@@ -630,13 +630,15 @@ def val(model, epoch, val_dataloader, args):
     pickle.dump(result_all, open(f".cache/tmp-results-{dist.get_rank()}.pkl", "wb"))
     torch.distributed.barrier()
     if dist.get_rank() == 0:
+        msg = {'cos_pre': cos_pre.item() / len(val_dataloader), 'cos_pre_self': cos_pre_self.item() / len(val_dataloader)}
+        print(msg)
+        wandb.log(msg)
         result_all = []
         for i in range(dist.get_world_size()):
             part_result = pickle.load(open(f".cache/tmp-results-{i}.pkl", "rb"))
             result_all.extend(part_result)
         pickle.dump(result_all, open(os.path.join(args.out_dir, f"{args.tag}-{epoch:03d}-results.pkl"), "wb"))
-    if dist.get_rank() == 0:
-        wandb.log({'cos_pre': cos_pre.item()/ len(val_dataloader), 'cos_pre_self': cos_pre_self.item()/ len(val_dataloader)})
+    torch.distributed.barrier()
     return result_all
 
 
