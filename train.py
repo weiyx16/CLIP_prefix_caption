@@ -159,6 +159,7 @@ class ClipCocoValDataset(Dataset):
         for annos in self.annotations:
             if len(self.id2captions[int(annos["image_id"])]) < 5:
                 self.id2captions[int(annos["image_id"])].append(annos["caption"])
+        json.dump(self.id2captions, open('./debug.json', 'w'))
         self.preprocess = _transform(224)
 
 
@@ -620,6 +621,7 @@ def val(model, epoch, val_dataloader, args):
         r = [{'image_id': _image_path, 'feature': _generated_text_prefix} for _image_path, _generated_text_prefix in zip(image_path, generated_text_prefix_cpu)]
         result_all.extend(r)
         # valiation metrics
+        captions = [list(per_cap) for per_cap in zip(*captions)] # the original captions are 5*bs
         for sample_idx, img_captions in enumerate(captions):
             tokens = tokenize(img_captions, add_start_and_end=True)['token']
             text_embedding = model.module.text_encode(tokens.cuda()) # 5*512
