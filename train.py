@@ -157,7 +157,8 @@ class ClipCocoValDataset(Dataset):
             self.annotations = json.load(f)["annotations"]
         self.id2captions = defaultdict(list)
         for annos in self.annotations:
-            self.id2captions[int(annos["image_id"])].append(annos["caption"])
+            if len(self.id2captions[int(annos["image_id"])]) < 5:
+                self.id2captions[int(annos["image_id"])].append(annos["caption"])
         self.preprocess = _transform(224)
 
 
