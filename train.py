@@ -120,8 +120,8 @@ class ClipCocoDataset(Dataset):
         captions_raw = all_data["captions"]
         self.image_ids = [caption["image_id"] for caption in captions_raw]
         self.captions = [caption['caption'] for caption in captions_raw]
-        if os.path.isfile(f"{data_path[:-4]}_tokens.pkl"):
-            with open(f"{data_path[:-4]}_tokens.pkl", 'rb') as f:
+        if os.path.isfile(f"{data_path[:-4]}_clip_tokens.pkl"):
+            with open(f"{data_path[:-4]}_clip_tokens.pkl", 'rb') as f:
                 self.captions_tokens, self.caption2embedding, self.max_seq_len = pickle.load(f)
         else:
             print(" inference the clip text tokens ")
@@ -133,7 +133,7 @@ class ClipCocoDataset(Dataset):
                 self.caption2embedding.append(caption["clip_embedding"]) # just index
                 max_seq_len = max(max_seq_len, self.captions_tokens[-1].shape[0])
             # self.max_seq_len = max_seq_len
-            with open(f"{data_path[:-4]}_tokens.pkl", 'wb') as f:
+            with open(f"{data_path[:-4]}_clip_tokens.pkl", 'wb') as f:
                 pickle.dump([self.captions_tokens, self.caption2embedding, max_seq_len], f)
         all_len = torch.tensor([len(self.captions_tokens[i]) for i in range(len(self))]).float()
         ## notice current one is 40
@@ -267,7 +267,13 @@ class ClipCocoValStage2Dataset(Dataset):
             self.files = f.read().splitlines()
 
         ## about pred_clip-text embedding
-        self.text_embedding_all = torch.load(f"{data_path[:-4]}_clip_tokens_embed_val_predbyprior.pkl").unsqueeze(1)
+        with open(f"{data_path[:-4]}_clip_tokens_embed_val_predbyprior.pkl", 'rb') as f:
+            self.text_embedding_all = pickle.load(f)
+        self.text_embedding_all_dict = dict()
+        for item in self.text_embedding_all:
+            self.text_embedding_all_dict[item['image_id']] = item['feature']
+        self.text_embedding_all = [self.text_embedding_all_dict[_file] for _file in self.files]
+        self.text_embedding_all = torch.stack(self.text_embedding_all, dim=0).unsqueeze(1) # 5000 * 1 * 512
 
 class MLP(nn.Module):
 
@@ -551,7 +557,7 @@ def val_prior(model, val_dataloader, args):
         result = None
     torch.distributed.barrier()
     if dist.get_rank() == 0:
-        wandb.log({'BLEU_4': result['Bleu_4'], 'METEOR': result['METEOR'], 'ROUGE_L': result['ROUGE_L'], 'CIDEr': result['CIDEr'], 'SPICE': result['SPICE']})
+        wandb.log({'Overall_BLEU_4': result['Bleu_4'], 'Overall_METEOR': result['METEOR'], 'Overall_ROUGE_L': result['ROUGE_L'], 'Overall_CIDEr': result['CIDEr'], 'Overall_SPICE': result['SPICE']})
     return result
 
 
