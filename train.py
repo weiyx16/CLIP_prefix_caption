@@ -10,7 +10,7 @@ from transformers import GPT2Tokenizer, AdamW, get_linear_schedule_with_warmup
 from transformers.models.gpt2.configuration_gpt2 import GPT2Config
 from tf import GPT2LMHeadModel
 from tqdm import tqdm
-import io
+import random
 import pickle
 import sys
 import argparse
@@ -56,27 +56,35 @@ class ClipCocoDataset(Dataset):
     def pad_tokens(self, item: int):
         # notice the endoftext in tokens is just used as placehold, will be replaced by a learnable bos embedding
         # tokens = torch.cat((torch.tensor(self.tokenizer.encode('<|endoftext|>')), self.captions_tokens[item]), dim=0)
-        tokens = torch.cat((self.captions_tokens[item], torch.tensor(self.tokenizer.encode('<|endoftext|>'))), dim=0)
-        _gt = torch.cat((self.captions_tokens[item], torch.tensor(self.tokenizer.encode('<|endoftext|>'))), dim=0)
+        eos_token = torch.tensor(self.tokenizer.encode('<|endoftext|>'))
+        src_token = self.captions_tokens[item]
+        tokens = torch.cat((src_token, eos_token), dim=0)
+        _gt = torch.cat((src_token, eos_token), dim=0)
         padding = self.max_seq_len - tokens.shape[0]
-        evert_t = sample_time(1, tokens.shape[0], tokens.device)
-        # evert_t is 0 to length-1, generate input; 0 means mask 1 to mask 0; length-1 means mask full to mask (l-1)
-        _maskids = torch.randperm(tokens.shape[0])[:evert_t+1]
-        tokens[_maskids] = 50257 # 50257 will be replaced with a standalone mask token
-        maskids = _maskids[-1] # The left one as gt; as previous, we only need this
-        gt = torch.full_like(_gt, -1)
-        gt[maskids] = _gt[maskids]
-
+        # we use global masking, so pad first, then add mask
         if padding > 0:
-            tokens = torch.cat((tokens, torch.zeros(padding, dtype=torch.int64) - 1))
-            gt = torch.cat((gt, torch.zeros(padding, dtype=torch.int64) - 1))  # we set target == -1 as ignore target
+            tokens = torch.cat((tokens, torch.zeros(padding, dtype=torch.int64) + eos_token), dim=0)
+            _gt = torch.cat((_gt, torch.zeros(padding, dtype=torch.int64) + eos_token), dim=0)  # we set target == -1 as ignore target
         elif padding < 0:
             tokens = tokens[:self.max_seq_len]
-            gt = gt[:self.max_seq_len]
-        mask = tokens.ge(0) # mask is zero where we out of sequence
-        tokens[~mask] = 0
-        masktoken_ids = [i.item() for i in _maskids[:-1] if i < self.max_seq_len]
-        mask[masktoken_ids] = 0
+            _gt = _gt[:self.max_seq_len]
+
+        evert_t = sample_time(1, self.time_step, tokens.device)
+        # evert_t is 0 to time_step-1, generate input; 0 means mask 1/step ratio; length-1 means mask full
+        evert_l = int((evert_t+1) / self.time_step * tokens.shape[0])
+        _maskids = torch.randperm(tokens.shape[0])[:evert_l]
+        tokens[_maskids] = 50257 # 50257 will be replaced with a standalone mask token
+        maskids = _maskids
+        gt = torch.full_like(_gt, -1)
+        gt[maskids] = _gt[maskids]
+        # mask = tokens.ge(0) # mask is zero where we out of sequence
+        # tokens[~mask] = 0
+        ex_mask = torch.zeros_like(tokens)
+        ex_nomask = torch.ones_like(tokens)
+        mask = torch.where(tokens == 50257, ex_mask, ex_nomask)
+        mask = mask.unsqueeze(dim=0).repeat_interleave(repeats=tokens.size(0), dim=0)
+        for each_token in range(mask.size(0)):
+            mask[each_token, each_token] = 1
         mask = mask.float()
         return tokens, mask, gt
 
@@ -99,7 +107,7 @@ class ClipCocoDataset(Dataset):
             prefix = prefix / prefix.norm(2, -1)
         return tokens, mask, image, gt
 
-    def __init__(self, data_root: str, data_path: str,  gpt2_type: str = "gpt2", normalize_prefix=False):
+    def __init__(self, data_root: str, data_path: str,  gpt2_type: str = "gpt2", normalize_prefix=False, time_step = 40):
         self.data_root = data_root
         self.tokenizer = GPT2Tokenizer.from_pretrained(gpt2_type)
         self.normalize_prefix = normalize_prefix
@@ -129,6 +137,7 @@ class ClipCocoDataset(Dataset):
         all_len = torch.tensor([len(self.captions_tokens[i]) for i in range(len(self))]).float()
         ## notice current one is 40
         self.max_seq_len = min(int(all_len.mean() + all_len.std() * 10), int(all_len.max()))
+        self.time_step = torch.tensor(time_step)
 
 
 class ClipCocoValDataset(Dataset):
@@ -144,11 +153,12 @@ class ClipCocoValDataset(Dataset):
         image = self.preprocess(image)
         return image, _filename
 
-    def __init__(self, data_root: str):
+    def __init__(self, data_root: str, max_seq_len = 40):
         self.data_root = data_root
         with open('captioneval/coco_val.txt') as f:
             self.files = f.read().splitlines()
         self.preprocess = _transform(224)
+        self.max_seq_len = max_seq_len
 
 
 class MLP(nn.Module):
@@ -427,7 +437,7 @@ def val(model, epoch, val_dataloader, args):
             assert False, "Not check beam search for now"
             generated_text_prefix = generate_beam(model, tokenizer, embed=prefix_embed)[0]
         else:
-            generated_text_prefix = generate2(model, tokenizer, embed=prefix_embed)
+            generated_text_prefix = generate2(model, tokenizer, entry_length=val_dataloader.dataset.max_seq_len, time_step=args.time_step, embed=prefix_embed)
 
         torch.cuda.synchronize()
         progress.update()
@@ -505,6 +515,7 @@ def parse_args():
     parser.add_argument('--bs', type=int, default=128)
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--wd', type=float, default=0.01)
+    parser.add_argument('--time_step',  type=int, default = 40)
     parser.add_argument('--only_prefix', dest='only_prefix', action='store_true')
     parser.add_argument('--mapping_type', type=str, default='mlp', help='mlp/transformer')
     parser.add_argument('--num_layers', type=int, default=8)
@@ -564,10 +575,10 @@ def main(args):
     train_sampler = torch.utils.data.distributed.DistributedSampler(dataset)
     train_dataloader = DataLoader(dataset, batch_size=args.bs, sampler=train_sampler, num_workers=8, pin_memory=True, drop_last=True)
 
-    val_dataset = ClipCocoValDataset(args.data_root)
+    val_dataset = ClipCocoValDataset(args.data_root, max_seq_len=dataset.max_seq_len)
     val_sampler = torch.utils.data.distributed.DistributedSampler(val_dataset, shuffle=False)
     val_dataloader = DataLoader(val_dataset, batch_size=args.bs, sampler=val_sampler, num_workers=8, pin_memory=True, drop_last=False)
-    
+
     lr_args = {"LR_SCHEDULER_NAME": "cosine", "EPOCHS": args.epochs, "WARMUP_EPOCHS": 5, "MIN_LR": 1e-6, "WARMUP_LR": 1e-7}
     lr_scheduler = build_scheduler(lr_args, optimizer, len(train_dataloader))
     

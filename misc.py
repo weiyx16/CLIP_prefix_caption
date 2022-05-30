@@ -237,6 +237,7 @@ def generate2(
         embed=None,
         entry_count=1,
         entry_length=40,  # maximum number of words
+        time_step=40,
         top_p=0.8,
         temperature=1.,
         stop_token: str = '<|endoftext|>',
@@ -253,43 +254,39 @@ def generate2(
         for entry_idx in range(entry_count):
             mask_feat = model.module.bos_embedding.unsqueeze(0).unsqueeze(0).repeat_interleave(repeats=embed.size(0), dim=0) # bs, 1, dim
             generated = mask_feat
-            # generated = generated.repeat_interleave(repeats=entry_length, dim=1)
+            generated = generated.repeat_interleave(repeats=entry_length, dim=1)
+            tokens = torch.full([embed.size(0), entry_length], 50257).to(device)
             stop_signal = torch.zeros(embed.size(0)).to(torch.bool).to(device)
-            for i in range(entry_length):
-                outputs = model.module.gpt(inputs_embeds=generated, encoder_hidden_states=embed)
+            for i in range(time_step):
+                ex_mask = torch.zeros_like(tokens)
+                ex_nomask = torch.ones_like(tokens)
+                all_mask = torch.where(tokens == 50257, ex_mask, ex_nomask)
+                all_mask = all_mask.unsqueeze(dim=1).repeat_interleave(repeats=tokens.size(1), dim=1)
+                for each_b in range(all_mask.size(0)):
+                    for each_token in range(all_mask[each_b].size(0)):
+                        all_mask[each_b, each_token, each_token] = 1
+                outputs = model.module.gpt(inputs_embeds=generated, attention_mask=all_mask,encoder_hidden_states=embed)
                 logits = outputs.logits
-                # we only need the last (newest) token, so using -1 will be ok.
-                logits = logits[:, -1, :] / (temperature if temperature > 0 else 1.0) # bs, vocab
-                sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-                cumulative_probs = torch.cumsum(nnf.softmax(sorted_logits, dim=-1), dim=-1)
-                sorted_indices_to_remove = cumulative_probs > top_p
-                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[
-                                                    ..., :-1
-                                                    ].clone()
-                sorted_indices_to_remove[..., 0] = 0 # incase of one word with > top_p prob
-
-                # indices_to_remove = sorted_indices[sorted_indices_to_remove]
-                # logits[:, indices_to_remove] = filter_value
-                for ele in range(logits.size(0)):
-                    logits[ele, sorted_indices[ele, sorted_indices_to_remove[ele]]] = filter_value
-                next_token = torch.argmax(logits, -1)
-                next_token_embed = model.module.gpt.transformer.wte(next_token).unsqueeze(1) # bs, 1, dim
-                next_token = next_token.unsqueeze(1) # bs, 1
-                if tokens is None:
-                    tokens = next_token
-                else:
-                    tokens = torch.cat((tokens, next_token), dim=1)
-                # for eachbatch in range(embed.size(0)):
-                #     generated[eachbatch, i, :] = next_token_embed[eachbatch, :, :]
-                if i == 0:
-                    generated = torch.cat((next_token_embed, mask_feat), dim=1)
-                else:
-                    generated = torch.cat((generated[:, :-1, :], next_token_embed, mask_feat), dim=1)
-                # stop in parallel one...
-                # one case: if all sentences appear eos, then we stop
-                stop_signal = stop_signal | (stop_token_index == next_token).squeeze()
-                if torch.all(stop_signal):
-                    break
+                logits = logits.softmax(dim=-1) # b * L * V
+                logits_conf, prob_dist = logits.max(dim=-1) # b * L
+                # mask out previous generated tokens
+                output_mask = torch.full_like(tokens, -1).float()
+                logits_conf_masked = torch.where(tokens == 50257, logits_conf, output_mask)
+                # pick out the max (top) confidence tokens
+                _, out_indx = logits_conf_masked.topk(entry_length // time_step, dim=-1)
+                # for each token, we choose the most prob one
+                # prob_dist = torch.argmax(logits, -1)
+                # next_tokens = prob_dist[out_indx]
+                # next_token_embed = model.module.gpt.transformer.wte(next_tokens)
+                # generated[out_indx, :] = next_token_embed
+                # tokens[out_indx] = next_tokens
+                for eachbatch in range(embed.size(0)):
+                    for out_tokens in range(out_indx.size(1)): # pick top K
+                        out_each_token_idx = out_indx[eachbatch, out_tokens]
+                        out_each_token = prob_dist[eachbatch, out_each_token_idx]
+                        next_token_embed = model.module.gpt.transformer.wte(out_each_token)
+                        generated[eachbatch, out_each_token_idx, :] = next_token_embed
+                        tokens[eachbatch, out_each_token_idx] = out_each_token
             output_list = list(tokens.cpu().numpy()) # bs, entry_length
             output_text =[tokenizer.decode(_output_list) for _output_list in output_list]
             generated_list.append(output_text)
