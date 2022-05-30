@@ -69,7 +69,7 @@ class ClipCocoDataset(Dataset):
             tokens = tokens[:self.max_seq_len]
             _gt = _gt[:self.max_seq_len]
 
-        evert_t = sample_time(1, self.time_step, tokens.device)
+        evert_t = sample_time(1, self.time_step, tokens.device).float()
         # evert_t is 0 to time_step-1, generate input; 0 means mask 1/step ratio; length-1 means mask full
         evert_l = int((evert_t+1) / self.time_step * tokens.shape[0])
         _maskids = torch.randperm(tokens.shape[0])[:evert_l]
