@@ -252,7 +252,8 @@ def generate2(
 
     with torch.no_grad():
         for entry_idx in range(entry_count):
-            generated = model.module.bos_embedding.unsqueeze(0).unsqueeze(0).repeat_interleave(repeats=embed.size(0), dim=0) # bs, 1, dim
+            mask_feat = model.module.bos_embedding.unsqueeze(0).unsqueeze(0).repeat_interleave(repeats=embed.size(0), dim=0) # bs, 1, dim
+            generated = mask_feat
             generated = generated.repeat_interleave(repeats=entry_length, dim=1)
             tokens = torch.full([embed.size(0), entry_length], 50257).to(device)
             stop_signal = torch.zeros(embed.size(0)).to(torch.bool).to(device)
@@ -266,20 +267,19 @@ def generate2(
                         all_mask[each_b, each_token, each_token] = 1
                 outputs = model.module.gpt(inputs_embeds=generated, attention_mask=all_mask,encoder_hidden_states=embed)
                 logits = outputs.logits
-                logits_t = logits.view(embed.size(0) * entry_length, logits.size(-1)).softmax(dim=-1)
-                # prob_dist = torch.multinomial(logits_t, 1).squeeze()  # probs should be of size batch x classes
-                prob_dist = torch.argmax(logits_t, 1)
-                logits_t_pro = torch.zeros_like(prob_dist).to(dtype=logits.dtype)
-                output_mask = torch.full_like(tokens, -1).unsqueeze(2)
-                output_mask = output_mask.repeat_interleave(repeats=logits.size(2), dim=2).to(dtype=logits.dtype)
-                output_mask = output_mask.view(embed.size(0) * entry_length, logits.size(-1))
-                logits_t = torch.where(tokens.unsqueeze(2).repeat_interleave(repeats=logits.size(2), dim=2).view(embed.size(0) * entry_length, logits.size(-1)) == 50257, logits_t, output_mask)
-                for prob_indx, prob in enumerate(prob_dist):
-                    logits_t_pro[prob_indx] = logits_t[prob_indx, prob]
-                # we only need the last (newest) token, so using -1 will be ok.
-                logits_t_pro = logits_t_pro.view(embed.size(0), entry_length)
-                prob_dist = prob_dist.view(embed.size(0), entry_length)
-                _, out_indx = logits_t_pro.topk(entry_length//time_step, dim=-1)
+                logits = logits.softmax(dim=-1) # b * L * V
+                logits_conf, prob_dist = logits.max(dim=-1) # b * L
+                # mask out previous generated tokens
+                output_mask = torch.full_like(tokens, -1).float()
+                logits_conf_masked = torch.where(tokens == 50257, logits_conf, output_mask)
+                # pick out the max (top) confidence tokens
+                _, out_indx = logits_conf_masked.topk(entry_length // time_step, dim=-1)
+                # for each token, we choose the most prob one
+                # prob_dist = torch.argmax(logits, -1)
+                # next_tokens = prob_dist[out_indx]
+                # next_token_embed = model.module.gpt.transformer.wte(next_tokens)
+                # generated[out_indx, :] = next_token_embed
+                # tokens[out_indx] = next_tokens
                 for eachbatch in range(embed.size(0)):
                     for out_tokens in range(out_indx.size(1)): # pick top K
                         out_each_token_idx = out_indx[eachbatch, out_tokens]
