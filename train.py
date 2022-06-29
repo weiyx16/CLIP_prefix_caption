@@ -1,39 +1,38 @@
-import os
-from re import I
-import torch
-import torch.nn as nn
-import torch.backends.cudnn as cudnn
-import torch.cuda.amp as amp
-from torch.nn import functional as nnf
-from torch.utils.data import Dataset, DataLoader
-from enum import Enum
-from transformers import GPT2Tokenizer, AdamW, get_linear_schedule_with_warmup
-from transformers.models.gpt2.configuration_gpt2 import GPT2Config
-from tf import GPT2LMHeadModel
-from tqdm import tqdm
-import io
-import pickle
-import sys
 import argparse
 import json
-from typing import Tuple, Optional, Union
-from clip1 import clip
-from clip1.clip import _transform
-import math
-import wandb
-import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
-import torch.multiprocessing as mp
-from PIL import Image
-from PIL import ImageFile
-ImageFile.LOAD_TRUNCATED_IMAGES = True
 import numpy as np
+import os
+import pickle
+import sys
+import wandb
+from enum import Enum
+from PIL import ImageFile
+from tqdm import tqdm
+from typing import Tuple, Optional, Union
+
+import torch
+import torch.backends.cudnn as cudnn
+import torch.cuda.amp as amp
+import torch.distributed as dist
+import torch.nn as nn
+from torch.nn import functional as nnf
+from torch.utils.data import Dataset, DataLoader
+from torch.nn.parallel import DistributedDataParallel as DDP
+from transformers import AdamW
+from transformers.models.gpt2.configuration_gpt2 import GPT2Config
+
+from clip1 import clip
 from lr_scheduler import build_scheduler
 from misc import generate2, generate_beam, evaluate_on_pure_caption, evaluate_on_coco_caption
+from tf import GPT2LMHeadModel
+
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+
 
 class MappingType(Enum):
     MLP = 'mlp'
     Transformer = 'transformer'
+
 
 def setup_for_distributed(is_master):
 
@@ -64,7 +63,7 @@ class ClipCocoDataset(Dataset):
         elif padding < 0:
             tokens = tokens[:self.max_seq_len]
             gt = gt[:self.max_seq_len]
-        mask = tokens.ge(0) # mask is zero where we out of sequence
+        mask = tokens.ge(0)  # mask is zero where we out of sequence
         tokens[~mask] = 0
         mask = mask.float()
         return tokens, mask, gt
@@ -97,13 +96,13 @@ class ClipCocoDataset(Dataset):
 
     def __getitem__(self, item: int) -> Tuple[torch.Tensor, ...]:
         tokens, mask, gt = self.pad_tokens(item)
-        ## this is for pre-computed clip feature
+        # this is for pre-computed clip feature
         prefix = self.prefixes[self.caption2embedding[item]]
         if self.normalize_prefix:
             prefix = prefix.float()
             prefix = prefix / prefix.norm(2, -1)
 
-        ## this is for text embedding
+        # this is for text embedding
         token_feature = self.preprocess_x0(self.text_embedding_all[item])
         return tokens, mask, token_feature, gt
 
@@ -130,16 +129,16 @@ class ClipCocoDataset(Dataset):
             max_seq_len = 0
             for caption in tqdm(captions_raw):
                 self.captions_tokens.append(torch.tensor(self.tokenizer.encode(caption['caption']), dtype=torch.int64))
-                self.caption2embedding.append(caption["clip_embedding"]) # just index
+                self.caption2embedding.append(caption["clip_embedding"])  # just index
                 max_seq_len = max(max_seq_len, self.captions_tokens[-1].shape[0])
             # self.max_seq_len = max_seq_len
             with open(f"{data_path[:-4]}_clip_tokens.pkl", 'wb') as f:
                 pickle.dump([self.captions_tokens, self.caption2embedding, max_seq_len], f)
         all_len = torch.tensor([len(self.captions_tokens[i]) for i in range(len(self))]).float()
-        ## notice current one is 40
+        # notice current one is 40
         self.max_seq_len = min(int(all_len.mean() + all_len.std() * 10), int(all_len.max()))
 
-        ## about clip-text embedding
+        # about clip-text embedding
         if os.path.isfile(f"{data_path[:-4]}_clip_tokens_embed.pkl"):
             with open(f"{data_path[:-4]}_clip_tokens_embed.pkl", 'rb') as f:
                 self.text_embedding_all = pickle.load(f)
@@ -173,6 +172,7 @@ class ClipCocoDataset(Dataset):
         self.sqrt_alphas_cumprod = np.sqrt(self.alphas_cumprod)
         self.sqrt_one_minus_alphas_cumprod = np.sqrt(1.0 - self.alphas_cumprod)
 
+
 class ClipCocoValDataset(Dataset):
 
     def __len__(self) -> int:
@@ -183,7 +183,7 @@ class ClipCocoValDataset(Dataset):
         return x0
 
     def __getitem__(self, item: int) -> Tuple[torch.Tensor, ...]:
-        ## this is for text embedding
+        # this is for text embedding
         token_feature = self.preprocess_x0(self.text_embedding_all[item])
         return token_feature, self.order_ids[item]
 
@@ -212,7 +212,7 @@ class ClipCocoValDataset(Dataset):
 
         self.order_ids = self.order_ids[:len(self.order_ids) // dist.get_world_size() * dist.get_world_size()]
 
-        ## about clip-text embedding
+        # about clip-text embedding
         if os.path.isfile(f"{data_path[:-4]}_clip_tokens_embed_val.pkl"):
             with open(f"{data_path[:-4]}_clip_tokens_embed_val.pkl", 'rb') as f:
                 self.text_embedding_all = pickle.load(f)
@@ -230,7 +230,10 @@ class ClipCocoValDataset(Dataset):
                 captions = self.captions_all[image_id]
                 captions.sort()
                 for caption in captions:
-                    tokens = torch.tensor(self.tokenizer.encode('<|startoftext|> '+caption+' <|endoftext|>'), dtype=torch.int64)
+                    tokens = torch.tensor(
+                        self.tokenizer.encode('<|startoftext|> '+caption+' <|endoftext|>'),
+                        dtype=torch.int64
+                    )
                     tokens_pad = torch.zeros(1, 77, dtype=torch.long)
                     tokens_pad[0, :len(tokens)] = tokens
                     with torch.no_grad():
@@ -242,6 +245,7 @@ class ClipCocoValDataset(Dataset):
             torch.distributed.barrier()
 
         self.text_embedding_all = torch.stack(self.text_embedding_all)
+
 
 class ClipCocoValStage2Dataset(Dataset):
     """
@@ -256,7 +260,7 @@ class ClipCocoValStage2Dataset(Dataset):
         return x0
 
     def __getitem__(self, item: int) -> Tuple[torch.Tensor, ...]:
-        ## this is for text embedding
+        # this is for text embedding
         token_feature = self.preprocess_x0(self.text_embedding_all[item])
         return token_feature, self.files[item]
 
@@ -267,14 +271,15 @@ class ClipCocoValStage2Dataset(Dataset):
         with open('captioneval/coco_val.txt') as f:
             self.files = f.read().splitlines()
 
-        ## about pred_clip-text embedding
+        # about pred_clip-text embedding
         with open(f"{data_path[:-4]}_clip_tokens_embed_val_predbyprior.pkl", 'rb') as f:
             self.text_embedding_all = pickle.load(f)
         self.text_embedding_all_dict = dict()
         for item in self.text_embedding_all:
             self.text_embedding_all_dict[item['image_id']] = item['feature']
         self.text_embedding_all = [self.text_embedding_all_dict[_file] for _file in self.files]
-        self.text_embedding_all = torch.stack(self.text_embedding_all, dim=0).unsqueeze(1) # 5000 * 1 * 512
+        self.text_embedding_all = torch.stack(self.text_embedding_all, dim=0).unsqueeze(1)  # 5000 * 1 * 512
+
 
 class MLP(nn.Module):
 
@@ -307,6 +312,7 @@ class MlpTransformer(nn.Module):
         x = self.fc2(x)
         x = self.dropout(x)
         return x
+
 
 class MultiHeadAttention(nn.Module):
 
@@ -373,7 +379,7 @@ class Transformer(nn.Module):
 
     def forward(self, x, y=None, mask=None):
         for i, layer in enumerate(self.layers):
-            if i % 2 == 0 and self.enc_dec: # cross
+            if i % 2 == 0 and self.enc_dec:  # cross
                 x = layer(x, y)
             elif self.enc_dec:  # self
                 x = layer(x, x, mask)
@@ -393,7 +399,9 @@ class Transformer(nn.Module):
             if i % 2 == 0 and enc_dec:  # cross
                 layers.append(TransformerLayer(dim_self, dim_ref, num_heads, mlp_ratio, act=act, norm_layer=norm_layer))
             elif enc_dec:  # self
-                layers.append(TransformerLayer(dim_self, dim_self, num_heads, mlp_ratio, act=act, norm_layer=norm_layer))
+                layers.append(
+                    TransformerLayer(dim_self, dim_self, num_heads, mlp_ratio, act=act, norm_layer=norm_layer)
+                )
             else:  # self or cross
                 layers.append(TransformerLayer(dim_self, dim_ref, num_heads, mlp_ratio, act=act, norm_layer=norm_layer))
         self.layers = nn.ModuleList(layers)
@@ -495,12 +503,14 @@ def load_model(model, args, epoch_or_latest: Union[str, int] = '_latest'):
         print(f"{model_path} is not exist")
     return model
 
+
 def check_keywords_in_name(name, keywords=()):
     isin = False
     for keyword in keywords:
         if keyword in name:
             isin = True
     return isin
+
 
 def get_pretrain_param_groups(model, skip_list=(), skip_keywords=()):
     has_decay = []
@@ -528,7 +538,7 @@ def get_pretrain_param_groups(model, skip_list=(), skip_keywords=()):
 def val_prior(model, val_dataloader, args):
     model.eval()
     tokenizer = clip._tokenizer
-    print(f">>> Evaling Prior Model")
+    print(">>> Evaling Prior Model")
     sys.stdout.flush()
     progress = tqdm(total=len(val_dataloader), desc=args.tag)
     result_all = []
@@ -545,7 +555,10 @@ def val_prior(model, val_dataloader, args):
         torch.cuda.synchronize()
         progress.update()
 
-        r = [{'image_id': _image_path, 'result': str(_text)} for _image_path, _text in zip(image_path, generated_text_prefix)]
+        r = [
+            {'image_id': _image_path, 'result': str(_text)}
+            for _image_path, _text in zip(image_path, generated_text_prefix)
+        ]
         result_all.extend(r)
     progress.close()
     os.makedirs('.cache', exist_ok=True)
@@ -556,12 +569,22 @@ def val_prior(model, val_dataloader, args):
         for i in range(dist.get_world_size()):
             part_result = json.load(open(f".cache/tmp-results-{i}.json"))
             result_all.extend(part_result)
-        result = evaluate_on_coco_caption(result_all, os.path.join(args.out_dir, f"{args.tag}-priormodel-results.json"), os.path.join(args.data_root, 'annotations/captions_val2014.json'))
+        result = evaluate_on_coco_caption(
+            result_all,
+            os.path.join(args.out_dir, f"{args.tag}-priormodel-results.json"),
+            os.path.join(args.data_root, 'annotations/captions_val2014.json')
+        )
     else:
         result = None
     torch.distributed.barrier()
     if dist.get_rank() == 0:
-        wandb.log({'Overall_BLEU_4': result['Bleu_4'], 'Overall_METEOR': result['METEOR'], 'Overall_ROUGE_L': result['ROUGE_L'], 'Overall_CIDEr': result['CIDEr'], 'Overall_SPICE': result['SPICE']})
+        wandb.log(
+            {'Overall_BLEU_4': result['Bleu_4'],
+             'Overall_METEOR': result['METEOR'],
+             'Overall_ROUGE_L': result['ROUGE_L'],
+             'Overall_CIDEr': result['CIDEr'],
+             'Overall_SPICE': result['SPICE']}
+        )
     return result
 
 
@@ -586,7 +609,10 @@ def val(model, epoch, val_dataloader, args):
         torch.cuda.synchronize()
         progress.update()
 
-        r = [{'text_id': _text_id.item(), 'result': str(_text)} for _text_id, _text in zip(text_id, generated_text_prefix)]
+        r = [
+            {'text_id': _text_id.item(), 'result': str(_text)}
+            for _text_id, _text in zip(text_id, generated_text_prefix)
+        ]
         result_all.extend(r)
     progress.close()
     os.makedirs('.cache', exist_ok=True)
@@ -597,12 +623,22 @@ def val(model, epoch, val_dataloader, args):
         for i in range(dist.get_world_size()):
             part_result = json.load(open(f".cache/tmp-results-{i}.json"))
             result_all.extend(part_result)
-        result = evaluate_on_pure_caption(result_all, os.path.join(args.out_dir, f"{args.tag}-{epoch:03d}-results.json"), os.path.join(args.data_root, 'annotations/captions_val2014_puretext.json'))
+        result = evaluate_on_pure_caption(
+            result_all,
+            os.path.join(args.out_dir, f"{args.tag}-{epoch:03d}-results.json"),
+            os.path.join(args.data_root, 'annotations/captions_val2014_puretext.json')
+        )
     else:
         result = None
     torch.distributed.barrier()
     if dist.get_rank() == 0:
-        wandb.log({'BLEU_4': result['Bleu_4'], 'METEOR': result['METEOR'], 'ROUGE_L': result['ROUGE_L'], 'CIDEr': result['CIDEr'], 'SPICE': result['SPICE']})
+        wandb.log(
+            {'BLEU_4': result['Bleu_4'],
+             'METEOR': result['METEOR'],
+             'ROUGE_L': result['ROUGE_L'],
+             'CIDEr': result['CIDEr'],
+             'SPICE': result['SPICE']}
+        )
     return result
 
 
@@ -627,8 +663,8 @@ def train(model, epoch, train_dataloader, optimizer, lr_scheduler, scaler, args,
         loss = nnf.cross_entropy(logits.reshape(-1, logits.shape[-1]), gt.flatten(), ignore_index=-1)
 
         optimizer.zero_grad()
-        scaler.scale(loss).backward() #loss.backward()
-        scaler.step(optimizer) #optimizer.step()
+        scaler.scale(loss).backward()  # loss.backward()
+        scaler.step(optimizer)  # optimizer.step()
         scaler.update()
         lr_scheduler.step_update(epoch * num_steps + idx)
         torch.cuda.synchronize()
@@ -677,7 +713,7 @@ def parse_args():
 def main(args):
     if dist.get_rank() == 0:
         wandb.login(key='c26712d8885e3e6742ffd9c311e10870a46a197f')
-        run = wandb.init(
+        wandb.init(
             id=args.tag,
             name=args.tag,
             entity='msravcg',
@@ -692,8 +728,13 @@ def main(args):
                                   num_layers=args.num_layers, mapping_type=args.mapping_type)
         print("Train only prefix")
     else:
-        model = ClipCaptionModel(args.prefix_length, clip_length=args.prefix_length_clip, prefix_size=prefix_dim,
-                                  num_layers=args.num_layers, mapping_type=args.mapping_type)
+        model = ClipCaptionModel(
+            args.prefix_length,
+            clip_length=args.prefix_length_clip,
+            prefix_size=prefix_dim,
+            num_layers=args.num_layers,
+            mapping_type=args.mapping_type
+        )
         print("Train both prefix and GPT")
         sys.stdout.flush()
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -716,43 +757,76 @@ def main(args):
         val_dataset = ClipCocoValStage2Dataset(args.data_root, args.data)
         # val_dataset = ClipCocoValDataset(args.data_root, args.data)
         val_sampler = torch.utils.data.distributed.DistributedSampler(val_dataset, shuffle=False)
-        val_dataloader = DataLoader(val_dataset, batch_size=args.bs, sampler=val_sampler, num_workers=8, pin_memory=True, drop_last=False)
+        val_dataloader = DataLoader(
+            val_dataset,
+            batch_size=args.bs,
+            sampler=val_sampler,
+            num_workers=8,
+            pin_memory=True,
+            drop_last=False
+        )
         result = val_prior(model, val_dataloader, args)
         # result = val(model, args.epochs, val_dataloader, args)
         return
 
     dataset = ClipCocoDataset(args.data_root, args.data, normalize_prefix=args.normalize_prefix)
     train_sampler = torch.utils.data.distributed.DistributedSampler(dataset)
-    train_dataloader = DataLoader(dataset, batch_size=args.bs, sampler=train_sampler, num_workers=8, pin_memory=True, drop_last=True)
+    train_dataloader = DataLoader(
+        dataset,
+        batch_size=args.bs,
+        sampler=train_sampler,
+        num_workers=8,
+        pin_memory=True,
+        drop_last=True
+    )
 
     val_dataset = ClipCocoValDataset(args.data_root, args.data)
     # val_dataset = ClipCocoValStage2Dataset(args.data_root, args.data)
     val_sampler = torch.utils.data.distributed.DistributedSampler(val_dataset, shuffle=False)
-    val_dataloader = DataLoader(val_dataset, batch_size=args.bs, sampler=val_sampler, num_workers=8, pin_memory=True, drop_last=False)
+    val_dataloader = DataLoader(
+        val_dataset,
+        batch_size=args.bs,
+        sampler=val_sampler,
+        num_workers=8,
+        pin_memory=True,
+        drop_last=False
+    )
 
-    lr_args = {"LR_SCHEDULER_NAME": "cosine", "EPOCHS": args.epochs, "WARMUP_EPOCHS": 5, "MIN_LR": 1e-6, "WARMUP_LR": 1e-7}
+    lr_args = {
+        "LR_SCHEDULER_NAME": "cosine",
+        "EPOCHS": args.epochs,
+        "WARMUP_EPOCHS": 5,
+        "MIN_LR": 1e-6,
+        "WARMUP_LR": 1e-7
+    }
     lr_scheduler = build_scheduler(lr_args, optimizer, len(train_dataloader))
 
     best_cider = 0
     for epoch in range(args.epochs):
-        _ = train(model, epoch, train_dataloader, optimizer, lr_scheduler, scaler, args, output_dir=args.out_dir, output_prefix=args.tag)
+        _ = train(model, epoch, train_dataloader, optimizer, lr_scheduler, scaler, args,
+                  output_dir=args.out_dir, output_prefix=args.tag)
         result = val(model, epoch, val_dataloader, args)
         # result = val_prior(model, val_dataloader, args)
         if epoch % args.save_every == 0 or epoch == args.epochs - 1:
             if dist.get_rank() == 0:
                 torch.save(
-                    {'model':model.module.state_dict(), 'lr_scheduler': lr_scheduler.state_dict(), 'optimizer': optimizer.state_dict(), 'scaler': scaler.state_dict()},
+                    {'model': model.module.state_dict(),
+                     'lr_scheduler': lr_scheduler.state_dict(),
+                     'optimizer': optimizer.state_dict(),
+                     'scaler': scaler.state_dict()},
                     os.path.join(args.out_dir, f"{args.tag}-{epoch:03d}.pt"),
                 )
         if dist.get_rank() == 0 and result['CIDEr'] > best_cider:
             best_cider = result['CIDEr']
             torch.save(
-                {'model':model.module.state_dict()},
+                {'model': model.module.state_dict()},
                 os.path.join(args.out_dir, f"{args.tag}-best.pt"),
             )
 
+
 if __name__ == '__main__':
-    # command:  python -m torch.distributed.launch --nproc_per_node 4 train.py --data ./oscar_split_ViT-B_32_train_512.pkl --out_dir ./output --bs 32
+    # command:  python -m torch.distributed.launch --nproc_per_node 4 train.py \
+    #           --data ./oscar_split_ViT-B_32_train_512.pkl --out_dir ./output --bs 32
     args = parse_args()
     if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
         rank = int(os.environ["RANK"])
@@ -763,7 +837,7 @@ if __name__ == '__main__':
         world_size = -1
     dist.init_process_group("nccl", init_method='env://', rank=args.local_rank, world_size=world_size)
     torch.distributed.barrier()
-    setup_for_distributed(args.local_rank == 0) ##### HERE
+    setup_for_distributed(args.local_rank == 0)  # HERE
 
     seed = dist.get_rank()
     torch.manual_seed(seed)
