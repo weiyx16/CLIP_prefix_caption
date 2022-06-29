@@ -161,7 +161,8 @@ class ClipCocoDataset(Dataset):
                 with open(f"{data_path[:-4]}_clip_tokens_embed.pkl", 'wb') as f:
                     pickle.dump(self.text_embedding_all, f)
             torch.distributed.barrier()
-        self.text_embedding_all = torch.stack(self.text_embedding_all)
+        if not torch.is_tensor(self.text_embedding_all):
+            self.text_embedding_all = torch.stack(self.text_embedding_all)
 
         # simulate noise term in diffusion:
         self.num_timesteps = 1000
@@ -208,7 +209,7 @@ class ClipCocoValDataset(Dataset):
             captions = self.captions_all[image_id]
             captions.sort()
             self.order_ids.extend(range(len(self.order_ids), len(self.order_ids)+len(captions)))
-        
+
         self.order_ids = self.order_ids[:len(self.order_ids) // dist.get_world_size() * dist.get_world_size()]
 
         ## about clip-text embedding
@@ -239,7 +240,7 @@ class ClipCocoValDataset(Dataset):
                 with open(f"{data_path[:-4]}_clip_tokens_embed_val.pkl", 'wb') as f:
                     pickle.dump(self.text_embedding_all, f)
             torch.distributed.barrier()
-            
+
         self.text_embedding_all = torch.stack(self.text_embedding_all)
 
 class ClipCocoValStage2Dataset(Dataset):
@@ -442,16 +443,19 @@ class ClipCaptionModel(nn.Module):
         configuration.update({'n_embd': prefix_size})
         configuration.update({'n_head': prefix_size//64})
         configuration.update({'add_cross_attention': False})
-        configuration.update({'vocab_size': 49152+256}) ## adapt to clip tokenizer
+        configuration.update({'vocab_size': 49152+256})  # adapt to clip tokenizer
         configuration = GPT2Config(**configuration)
         self.gpt = GPT2LMHeadModel(configuration)
         self.gpt_embedding_size = self.gpt.transformer.wte.weight.shape[1]
         if mapping_type == MappingType.MLP:
-            self.clip_project = MLP((prefix_size, self.gpt_embedding_size // 2,
-                                     self.gpt_embedding_size ))
+            self.clip_project = MLP((prefix_size,
+                                     self.gpt_embedding_size // 2,
+                                     self.gpt_embedding_size))
         else:
-            self.clip_project = TransformerMapper(prefix_size, self.gpt_embedding_size, prefix_length,
-                                                                     clip_length, num_layers)
+            self.clip_project = TransformerMapper(prefix_size,
+                                                  self.gpt_embedding_size,
+                                                  prefix_length,
+                                                  clip_length, num_layers)
 
 
 class ClipCaptionPrefix(ClipCaptionModel):
@@ -503,7 +507,7 @@ def get_pretrain_param_groups(model, skip_list=(), skip_keywords=()):
     no_decay = []
     has_decay_name = []
     no_decay_name = []
-    
+
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
@@ -530,7 +534,7 @@ def val_prior(model, val_dataloader, args):
     result_all = []
     for idx, (prefix, image_path) in enumerate(val_dataloader):
         prefix = prefix.cuda(non_blocking=True)
-        
+
         prefix_embed = model.module.clip_project(prefix)
         if args.use_beam_search:
             assert False, "Not check beam search for now"
@@ -571,7 +575,7 @@ def val(model, epoch, val_dataloader, args):
     result_all = []
     for idx, (prefix, text_id) in enumerate(val_dataloader):
         prefix = prefix.cuda(non_blocking=True)
-        
+
         prefix_embed = model.module.clip_project(prefix)
         if args.use_beam_search:
             assert False, "Not check beam search for now"
@@ -621,7 +625,7 @@ def train(model, epoch, train_dataloader, optimizer, lr_scheduler, scaler, args,
             outputs = model(tokens, prefix, mask)
         logits = outputs.logits
         loss = nnf.cross_entropy(logits.reshape(-1, logits.shape[-1]), gt.flatten(), ignore_index=-1)
-        
+
         optimizer.zero_grad()
         scaler.scale(loss).backward() #loss.backward()
         scaler.step(optimizer) #optimizer.step()
@@ -698,7 +702,7 @@ def main(args):
     local_rank = args.local_rank
     torch.cuda.set_device(local_rank)
     model = model.cuda()
-    
+
     parameters = get_pretrain_param_groups(model)
     optimizer = AdamW(parameters, lr=args.lr, weight_decay=args.wd)
     scaler = amp.GradScaler()
@@ -710,9 +714,11 @@ def main(args):
         _ = load_model(model_without_ddp, args, epoch_or_latest=args.epochs-1)
         # build Dataset
         val_dataset = ClipCocoValStage2Dataset(args.data_root, args.data)
+        # val_dataset = ClipCocoValDataset(args.data_root, args.data)
         val_sampler = torch.utils.data.distributed.DistributedSampler(val_dataset, shuffle=False)
-        val_dataloader = DataLoader(val_dataset, batch_size=args.bs, sampler=val_sampler, num_workers=8, pin_memory=True, drop_last=False)   
+        val_dataloader = DataLoader(val_dataset, batch_size=args.bs, sampler=val_sampler, num_workers=8, pin_memory=True, drop_last=False)
         result = val_prior(model, val_dataloader, args)
+        # result = val(model, args.epochs, val_dataloader, args)
         return
 
     dataset = ClipCocoDataset(args.data_root, args.data, normalize_prefix=args.normalize_prefix)
@@ -720,16 +726,18 @@ def main(args):
     train_dataloader = DataLoader(dataset, batch_size=args.bs, sampler=train_sampler, num_workers=8, pin_memory=True, drop_last=True)
 
     val_dataset = ClipCocoValDataset(args.data_root, args.data)
+    # val_dataset = ClipCocoValStage2Dataset(args.data_root, args.data)
     val_sampler = torch.utils.data.distributed.DistributedSampler(val_dataset, shuffle=False)
     val_dataloader = DataLoader(val_dataset, batch_size=args.bs, sampler=val_sampler, num_workers=8, pin_memory=True, drop_last=False)
-    
+
     lr_args = {"LR_SCHEDULER_NAME": "cosine", "EPOCHS": args.epochs, "WARMUP_EPOCHS": 5, "MIN_LR": 1e-6, "WARMUP_LR": 1e-7}
     lr_scheduler = build_scheduler(lr_args, optimizer, len(train_dataloader))
-    
+
     best_cider = 0
     for epoch in range(args.epochs):
         _ = train(model, epoch, train_dataloader, optimizer, lr_scheduler, scaler, args, output_dir=args.out_dir, output_prefix=args.tag)
         result = val(model, epoch, val_dataloader, args)
+        # result = val_prior(model, val_dataloader, args)
         if epoch % args.save_every == 0 or epoch == args.epochs - 1:
             if dist.get_rank() == 0:
                 torch.save(
