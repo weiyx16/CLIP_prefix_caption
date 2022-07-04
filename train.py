@@ -84,6 +84,7 @@ class ClipCocoDataset(Dataset):
 
     def preprocess_x0(self, x0):
         x0 = x0 / self.text_embedding_all_var
+        # return x0
         weights = np.cos(np.linspace(0, np.pi/2, self.num_timesteps))
         t = torch.multinomial(torch.tensor(weights), x0.size(0), replacement=True)
         noise = torch.randn_like(x0)
@@ -105,6 +106,11 @@ class ClipCocoDataset(Dataset):
         # this is for text embedding
         token_feature = self.preprocess_x0(self.text_embedding_all[item])
         return tokens, mask, token_feature, gt
+
+        # # this is for text embedding
+        # token_feature = self.preprocess_x0(self.text_embedding_all[item])
+        # image_id = self.image_ids[item]
+        # return token_feature, image_id
 
     def __init__(self, data_root: str, data_path: str,  gpt2_type: str = "gpt2", normalize_prefix=False):
         self.data_root = data_root
@@ -171,6 +177,56 @@ class ClipCocoDataset(Dataset):
         self.alphas_cumprod = np.cumprod(alphas, axis=0)
         self.sqrt_alphas_cumprod = np.sqrt(self.alphas_cumprod)
         self.sqrt_one_minus_alphas_cumprod = np.sqrt(1.0 - self.alphas_cumprod)
+
+
+class ClipCocoTrainDataset(Dataset):
+
+    def __len__(self) -> int:
+        return len(self.order_ids)
+
+    def preprocess_x0(self, x0):
+        x0 = x0 / self.text_embedding_all_var
+        return x0
+
+    def __getitem__(self, item: int) -> Tuple[torch.Tensor, ...]:
+        # this is for text embedding
+        token_feature = self.preprocess_x0(self.text_embedding_all[item])
+        return token_feature, self.order_ids[item]
+
+    def __init__(self, data_root: str, data_path: str):
+        self.tokenizer = clip._tokenizer
+        self.text_embedding_all_var = 1.0
+        self.data_root = data_root
+        with open('captioneval/coco_train_110k.txt') as f:
+            self.files = f.read().splitlines()
+
+        # load text:
+        annos = json.load(open(os.path.join(data_root, 'annotations', 'captions_train2014_110k.json')))['annotations']
+        self.captions_all = dict()
+        for anno in annos:
+            if anno["image_id"] in self.captions_all:
+                self.captions_all[anno["image_id"]].append(anno["caption"])
+            else:
+                self.captions_all[anno["image_id"]] = [anno["caption"]]
+
+        self.order_ids = list(range(len(self.files)))
+        # for image_file in self.files:
+        #     image_id = int(image_file.split('_')[-1].split('.')[0])
+        #     captions = self.captions_all[image_id]
+        #     captions.sort()
+        #     self.order_ids.extend(range(len(self.order_ids), len(self.order_ids)+len(captions)))
+
+        self.order_ids = self.order_ids[:len(self.order_ids) // dist.get_world_size() * dist.get_world_size()]
+
+        # about clip-text embedding
+        if os.path.isfile(f"{data_path[:-4]}_clip_tokens_embed.pkl"):
+            with open(f"{data_path[:-4]}_clip_tokens_embed.pkl", 'rb') as f:
+                self.text_embedding_all = pickle.load(f)
+        else:
+            raise NotImplementedError
+
+        if not torch.is_tensor(self.text_embedding_all):
+            self.text_embedding_all = torch.stack(self.text_embedding_all)
 
 
 class ClipCocoValDataset(Dataset):
@@ -573,6 +629,7 @@ def val_prior(model, val_dataloader, args):
             result_all,
             os.path.join(args.out_dir, f"{args.tag}-priormodel-results.json"),
             os.path.join(args.data_root, 'annotations/captions_val2014.json')
+            # os.path.join(args.data_root, 'annotations/captions_train_110k.json')
         )
     else:
         result = None
@@ -627,6 +684,7 @@ def val(model, epoch, val_dataloader, args):
             result_all,
             os.path.join(args.out_dir, f"{args.tag}-{epoch:03d}-results.json"),
             os.path.join(args.data_root, 'annotations/captions_val2014_puretext.json')
+            # os.path.join(args.data_root, 'annotations/captions_train2014_110k_puretext.json')
         )
     else:
         result = None
@@ -755,7 +813,9 @@ def main(args):
         _ = load_model(model_without_ddp, args, epoch_or_latest=args.epochs-1)
         # build Dataset
         val_dataset = ClipCocoValStage2Dataset(args.data_root, args.data)
+        # val_dataset = ClipCocoDataset(args.data_root, args.data, normalize_prefix=args.normalize_prefix)
         # val_dataset = ClipCocoValDataset(args.data_root, args.data)
+        # val_dataset = ClipCocoTrainDataset(args.data_root, args.data)
         val_sampler = torch.utils.data.distributed.DistributedSampler(val_dataset, shuffle=False)
         val_dataloader = DataLoader(
             val_dataset,
